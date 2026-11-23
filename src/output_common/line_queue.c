@@ -49,7 +49,7 @@ void lq_free(LineQueue_t* queue) {
 }
 
 uint8_t* IRAM_ATTR lq_current(LineQueue_t* queue) {
-    int current = atomic_load_explicit(&queue->current, memory_order_acquire);
+    int current = atomic_load_explicit(&queue->current, memory_order_relaxed);
     int last = atomic_load_explicit(&queue->last, memory_order_acquire);
 
     if ((current + 1) % queue->size == last) {
@@ -59,14 +59,14 @@ uint8_t* IRAM_ATTR lq_current(LineQueue_t* queue) {
 }
 
 void IRAM_ATTR lq_commit(LineQueue_t* queue) {
-    int current = atomic_load_explicit(&queue->current, memory_order_acquire);
+    int current = atomic_load_explicit(&queue->current, memory_order_relaxed);
     int next = (current + 1) % queue->size;
     atomic_store_explicit(&queue->current, next, memory_order_release);
 }
 
 int IRAM_ATTR lq_read(LineQueue_t* queue, uint8_t* dst) {
     int current = atomic_load_explicit(&queue->current, memory_order_acquire);
-    int last = atomic_load_explicit(&queue->last, memory_order_acquire);
+    int last = atomic_load_explicit(&queue->last, memory_order_relaxed);
 
     if (current == last) {
         return -1;

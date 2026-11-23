@@ -32,7 +32,18 @@ __attribute__((optimize("O3"))) uint32_t epd_interlace_4bpp_line_VE(
     }
     // 两像素一字节：成对处理，少一次 x/2、x%2
     const int pairs = fb_width >> 1;
-    for (int p = 0; p < pairs; p++) {
+    int p=0;
+    for (;p+4<=pairs;p+=4) {
+        uint32_t t,f,c; memcpy(&t,to+p,4); memcpy(&f,from+p,4);
+        memcpy(&c,col_dirtyness+p,4); c|=t^f; memcpy(col_dirtyness+p,&c,4);
+        dirty|=t^f;
+        const uint32_t lo=((t&0x0f0f0f0fu)<<4)|(f&0x0f0f0f0fu);
+        const uint32_t hi=(t&0xf0f0f0f0u)|((f>>4)&0x0f0f0f0fu);
+        const uint32_t a=(lo&255)|((hi&255)<<8)|((lo&0xff00)<<8)|((hi&0xff00)<<16);
+        const uint32_t b=((lo>>16)&255)|((hi>>8)&0xff00)|((lo>>8)&0xff0000)|(hi&0xff000000);
+        memcpy(interlaced+p*2,&a,4); memcpy(interlaced+p*2+4,&b,4);
+    }
+    for (;p<pairs;p++) {
         const uint8_t tb = to[p];
         const uint8_t fb = from[p];
         const uint8_t t0 = (uint8_t)(tb & 0x0f);
@@ -86,7 +97,7 @@ epd_apply_line_mask_VE(uint8_t* line, const uint8_t* mask, int mask_len) {
 /**
  * @brief 1ppB / 1K VE 格式 LUT 查表（与 lut.c lookup_pixels_in_VE_LUT 一致）
  * @note S31 与 S3 字节内 4px 高低位对调：板级/LCD 沿 X 先吃高位 2bit，非 CPU 端序差异。
- *       VE LUT 每项占 4 字节，值在 LE 低字节；按字节取比整字 load 更省带宽。
+ *       S31 使用四段预移位 LUT，每四个输出字节合并写入。
  */
 __attribute__((optimize("O3"))) void IRAM_ATTR
 calc_epd_input_1ppB_1k_S3_VE_aligned(
@@ -100,25 +111,24 @@ calc_epd_input_1ppB_1k_S3_VE_aligned(
     const uint32_t n = epd_width >> 2; // 输出字节数 = 像素/4
     uint32_t j = 0;
 
-#if defined(CONFIG_IDF_TARGET_ESP32S31)
-#define LUT4(in)                                                                                   \
-    ((uint8_t)(lut[((in) & 0xFFu) << 2] << 6 | lut[(((in) >> 8) & 0xFFu) << 2] << 4                \
-               | lut[(((in) >> 16) & 0xFFu) << 2] << 2 | lut[((in) >> 24) << 2]))
-#else
-#define LUT4(in)                                                                                   \
+    #if defined(CONFIG_IDF_TARGET_ESP32S31)
+    #define LUT4(in)                                                                                \
+    ((uint8_t)(lut[0x300 + ((in) & 0xFFu)] | lut[0x200 + (((in) >> 8) & 0xFFu)]                     \
+               | lut[0x100 + (((in) >> 16) & 0xFFu)] | lut[(in) >> 24]))
+    #else
+    #define LUT4(in)                                                                                \
     ((uint8_t)(lut[((in) >> 24) << 2] << 6 | lut[(((in) >> 16) & 0xFFu) << 2] << 4                 \
                | lut[(((in) >> 8) & 0xFFu) << 2] << 2 | lut[((in) & 0xFFu) << 2]))
-#endif
+    #endif
 
     for (; j + 4 <= n; j += 4) {
         const uint32_t in0 = ld[j];
         const uint32_t in1 = ld[j + 1];
         const uint32_t in2 = ld[j + 2];
         const uint32_t in3 = ld[j + 3];
-        epd_input[j] = LUT4(in0);
-        epd_input[j + 1] = LUT4(in1);
-        epd_input[j + 2] = LUT4(in2);
-        epd_input[j + 3] = LUT4(in3);
+        const uint32_t output=(uint32_t)LUT4(in0)|((uint32_t)LUT4(in1)<<8)|
+            ((uint32_t)LUT4(in2)<<16)|((uint32_t)LUT4(in3)<<24);
+        memcpy(epd_input+j,&output,4);
     }
     for (; j < n; j++) {
         epd_input[j] = LUT4(ld[j]);

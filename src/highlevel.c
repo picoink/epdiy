@@ -125,8 +125,8 @@ enum EpdDrawError epd_hl_update_screen_full(
         full,
         MODE_PACKING_1PPB_DIFFERENCE | mode,
         temperature,
-        state->dirty_lines,
-        state->dirty_columns,
+        NULL,
+        NULL,
         state->waveform
     );
 
@@ -245,7 +245,7 @@ enum EpdDrawError epd_hl_update_area(EpdiyHighlevelState* state, enum EpdDrawMod
         MODE_PACKING_1PPB_DIFFERENCE | MODE_SKIP_UNCHANGED | mode,
         temperature,
         state->dirty_lines,
-        state->dirty_columns,
+        (mode & 0x3f) == MODE_DU ? state->dirty_columns : NULL,
         state->waveform
     );
 

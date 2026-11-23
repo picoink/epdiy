@@ -1,6 +1,8 @@
 
 set(app_sources "src/epdiy.c"
                 "src/render.c"
+                "src/epd_metrics.c"
+                "src/output_common/riscv_ve.c"
                 "src/output_lcd/render_lcd.c"
                 "src/output_lcd/lcd_driver.c"
                 "src/output_i2s/render_i2s.c"
