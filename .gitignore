@@ -24,6 +24,7 @@ epaper-breakout-backups/
 dependencies.lock
 ED*.h
 ES*.h
+!test/host/stubs/esp*.h
 examples/private_*/
 *.code-workspace
 # MAC

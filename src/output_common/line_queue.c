@@ -9,6 +9,12 @@
 #include "line_queue.h"
 #include "render_method.h"
 
+// Product adapters may account these boot-critical buffers in their ledger.
+__attribute__((weak)) void* epd_allocate_line_queue(size_t bytes) {
+    return heap_caps_aligned_alloc(16,bytes,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+}
+__attribute__((weak)) void epd_release_line_queue(void* pointer) {heap_caps_free(pointer);}
+
 static inline int ceil_div(int x, int y) {
     return x / y + (x % y != 0);
 }
@@ -18,6 +24,7 @@ LineQueue_t lq_init(int queue_len, int element_size) {
     LineQueue_t queue;
     queue.element_size = element_size;
     queue.size = queue_len;
+    queue.storage = NULL;
     atomic_init(&queue.current, 0);
     atomic_init(&queue.last, 0);
 
@@ -26,14 +33,24 @@ LineQueue_t lq_init(int queue_len, int element_size) {
     queue.bufs = calloc(queue.size, sizeof(uint8_t*));
     assert(queue.bufs != NULL);
 
-    // 短队列（流式预填）只放 INTERNAL，不够直接 assert
     size_t line_q_bytes = 0;
+#if EPD_LINE_QUEUE_PSRAM
+    // The LCD ISR copies rows into its own internal DMA buffer. These queues
+    // are CPU sources, never DMA sources. The integrator must gate every flash
+    // cache-disable operation until the complete display scan has finished.
+    queue.storage=epd_allocate_line_queue((size_t)elem_buf_size*queue.size);
+    assert(queue.storage != NULL);
+#endif
     for (int i = 0; i < queue.size; i++) {
+#if EPD_LINE_QUEUE_PSRAM
+        queue.bufs[i]=queue.storage+(size_t)i*elem_buf_size;
+#else
         queue.bufs[i] = heap_caps_aligned_alloc(16, elem_buf_size, MALLOC_CAP_INTERNAL);
+#endif
         assert(queue.bufs[i] != NULL);
         line_q_bytes += (size_t)elem_buf_size;
     }
-    ESP_LOGD("epd_dram", "line_q elems=%d×%d=%u B INTERNAL", queue.size, elem_buf_size,
+    ESP_LOGD("epd_dram", "line_q elems=%d×%d=%u B", queue.size, elem_buf_size,
              (unsigned)line_q_bytes);
 
     return queue;
@@ -41,7 +58,8 @@ LineQueue_t lq_init(int queue_len, int element_size) {
 
 /// Deinitialize the line queue and free memory.
 void lq_free(LineQueue_t* queue) {
-    for (int i = 0; i < queue->size; i++) {
+    if(queue->storage)epd_release_line_queue(queue->storage);
+    else for (int i = 0; i < queue->size; i++) {
         heap_caps_free(queue->bufs[i]);
     }
 

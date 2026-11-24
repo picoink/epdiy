@@ -12,6 +12,7 @@ typedef struct {
     atomic_int current;
     atomic_int last;
     uint8_t** bufs;
+    uint8_t* storage;
     // size of an element
     size_t element_size;
 } LineQueue_t;
