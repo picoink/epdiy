@@ -347,6 +347,16 @@ void epd_renderer_init(enum EpdInitOptions options) {
     render_context.display_width = epd_width();
     render_context.display_height = epd_height();
 
+#ifdef RENDER_METHOD_LCD
+    // Reserve the clear row before application allocations fragment HP SRAM.
+    // S31's default/internal heap also includes slow LP RAM: reading a row from
+    // there in the DMA ISR can exceed the entire bounce-buffer refill interval.
+    render_context.static_line_buffer = heap_caps_malloc(
+        render_context.display_width / 4, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT
+    );
+    assert(render_context.static_line_buffer != NULL);
+#endif
+
     size_t lut_size = 0;
     if (options & EPD_LUT_1K) {
         lut_size = 1 << 10;
@@ -371,7 +381,6 @@ void epd_renderer_init(enum EpdInitOptions options) {
         abort();
     }
     render_context.conversion_lut_size = lut_size;
-    render_context.static_line_buffer = NULL;
 
     render_context.frame_done = xSemaphoreCreateBinary();
     render_context.prefill_done = xSemaphoreCreateCounting(NUM_RENDER_THREADS, 0);
@@ -481,6 +490,10 @@ void epd_renderer_deinit() {
     heap_caps_free(render_context.line_threads);
     heap_caps_free(render_context.line_ready);
     heap_caps_free(render_context.line_mask);
+#ifdef RENDER_METHOD_LCD
+    heap_caps_free(render_context.static_line_buffer);
+    render_context.static_line_buffer = NULL;
+#endif
     vSemaphoreDelete(render_context.frame_done);
     vSemaphoreDelete(render_context.prefill_done);
 }

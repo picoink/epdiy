@@ -88,6 +88,7 @@ typedef struct {
     int skipping;
 
     /// line buffer when using epd_push_pixels
+    // LCD clear row, reserved in fast SRAM for the renderer's whole lifetime.
     uint8_t* static_line_buffer;
 } RenderContext_t;
 

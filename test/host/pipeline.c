@@ -42,6 +42,7 @@ void epd_set_mode(bool mode){(void)mode;}
 static pthread_t scanner;static bool scan_joinable;
 static line_cb_func_t source;static frame_done_func_t done;static void *source_ctx,*done_ctx;
 static int test_fault;static int64_t scan_at,last_scan;
+static bool clearing;static unsigned clear_drive;
 void epd_lcd_line_source_cb(line_cb_func_t cb,void* p){source=cb;source_ctx=p;}
 void epd_lcd_frame_done_cb(frame_done_func_t cb,void* p){done=cb;done_ctx=p;}
 void epd_lcd_get_stream_stats(int* a,int* b){*a=*b=0;}
@@ -58,6 +59,18 @@ static void* scan_run(void* p) {
   if(test_fault==1 && y==16) break; // Incomplete LCD scan.
   if(test_fault==2 && y==16){while(!atomic_load(&abort_scan))usleep(100);break;} // Lost completion.
   source(source_ctx,row);
+  if(clearing) {
+   for(unsigned x=0;x<sizeof(row);++x) {
+    unsigned expected=0;
+    for(unsigned j=0;j<4;++j) {
+     int pixel=x*4+j;
+     if(y>=ctx->area.y && y<ctx->area.y+ctx->area.height &&
+        pixel>=ctx->area.x && pixel<ctx->area.x+ctx->area.width)
+      expected|=clear_drive<<(6-2*j);
+    }
+    assert(row[x]==expected);
+   }
+  } else {
   for(unsigned x=0;x<sizeof(row);++x){
    unsigned expected=0;
    for(unsigned j=0;j<4;++j){unsigned v=ctx->data_ptr[y*64+x*4+j];
@@ -65,6 +78,7 @@ static void* scan_run(void* p) {
     expected|=((phases[(phase*16+target)*4+old/4]>>(6-2*(old%4)))&3)<<(6-2*j);
    }
    if(!test_fault)assert(row[x]==expected);
+  }
   }
   usleep(50);
  }
@@ -126,8 +140,25 @@ int main(void){
   if(!test_fault){assert(m.completed==5);assert(m.pixel_clock_hz==20000000);assert(!m.fault_phase && !m.fault_line && !m.fault_thread);}
   for(int i=0;i<2;++i){assert(atomic_load(&ctx.line_queues[i].current)==atomic_load(&ctx.line_queues[i].last));assert(!atomic_load(&ctx.feed_waiting[i]));}
  }
+ // The clear ISR must reuse its reserved row across colors, cropped regions,
+ // interrupted scans and missing completion. A per-clear malloc/free fails
+ // this ownership check and makes SRAM placement depend on unrelated heaps.
+ uint32_t clear_words[6];memset(clear_words,0xCD,sizeof(clear_words));
+ uint8_t* clear_row=(uint8_t*)(clear_words+1);
+ ctx.static_line_buffer=clear_row;clearing=true;
+ ctx.area=(EpdRect){4,2,52,679};
+ for(unsigned t=0;t<sizeof(scenarios)/sizeof(*scenarios);++t) {
+  test_fault=scenarios[t];ctx.error=0;epd_metrics_reset();
+  int color=t%3;clear_drive=color==0 ? 1 : color==1 ? 2 : 0;
+  epd_push_pixels_lcd(&ctx,120,color);epd_lcd_abort_frame();
+  assert(ctx.static_line_buffer==clear_row);
+  assert(clear_words[0]==0xCDCDCDCD && clear_words[5]==0xCDCDCDCD);
+  assert((ctx.error!=0)==(test_fault!=0));
+  EpdMetrics m=epd_metrics_get();assert(m.faults==(test_fault!=0));
+  if(test_fault){assert(m.fault_phase==1 && m.fault_line==16 && m.completed==0);}
+ }
  assert(atomic_load(&overlap)>0);atomic_store(&quit,true);
  for(int i=0;i<2;++i){xTaskNotifyGive(&tasks[i]);pthread_join(tasks[i].thread,0);lq_free(&ctx.line_queues[i]);vSemaphoreDelete(tasks[i].notify);vSemaphoreDelete(ctx.feed_done_smphr[i]);vSemaphoreDelete(ctx.feed_space[i]);}
  vSemaphoreDelete(ctx.prefill_done);vSemaphoreDelete(ctx.frame_done);free(ctx.line_ready);free(ctx.line_threads);free(ctx.line_mask);free(ctx.conversion_lut);free(data);
- puts("LCD pipeline: phase pixels, overlapped queues, cancellation, missing completion and recovery passed");
+ puts("LCD pipeline: phase pixels, queues, persistent clear rows, fault metrics and recovery passed");
 }

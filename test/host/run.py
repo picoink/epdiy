@@ -6,7 +6,7 @@ here=Path(__file__).resolve().parent
 src=here.parents[1]/'src'
 with tempfile.TemporaryDirectory(prefix='epd-pipeline-') as tmp:
     exe=Path(tmp)/'pipeline'
-    subprocess.run([os.environ.get('CC','cc'),'-std=gnu11','-O2','-pthread','-g','-fsanitize=undefined',
+    subprocess.run([os.environ.get('CC','cc'),'-std=gnu11','-O2','-pthread','-g','-fsanitize=undefined','-fno-sanitize-recover=all',
         '-Wall','-Wextra','-Wno-unknown-attributes','-Wno-unused-parameter',
         '-I'+str(here/'stubs'),'-I'+str(src),str(here/'pipeline.c'),
         *(str(src/p) for p in ('output_lcd/render_lcd.c','output_common/render_context.c','output_common/line_queue.c','output_common/lut.c','epd_metrics.c','output_common/riscv_ve.c')),
