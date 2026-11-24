@@ -398,7 +398,6 @@ void epd_push_pixels_lcd(RenderContext_t* ctx, short time, int color) {
     ctx->scan_frame = 0;
     ctx->lines_total = ctx->display_height;
     ctx->lines_consumed = 0;
-    ctx->static_line_buffer = malloc(ctx->display_width / 4);
     assert(ctx->static_line_buffer != NULL);
 
     push_pixels_populate_line(ctx, color);
@@ -417,12 +416,22 @@ void epd_push_pixels_lcd(RenderContext_t* ctx, short time, int color) {
     epd_set_mode(0);
 
     if (ctx->error) {
-        ESP_LOGE("epd_lcd", "clear scan failed reason=%d line=%d/%d", ctx->fault_reason,
-                 ctx->lines_consumed, ctx->lines_total);
+        int gap = 0, work = 0;
+        epd_lcd_get_stream_stats(&gap, &work);
+        ESP_LOGE("epd_lcd", "clear scan failed reason=%d line=%d/%d eof_gap=%dus eof_work=%dus",
+                 ctx->fault_reason, ctx->lines_consumed, ctx->lines_total, gap, work);
+        // Clear failures precede the waveform cycle; still expose them through
+        // the same metrics instead of reporting zero faults after a failed boot.
+        EpdMetrics sample = {0};
+        sample.phases = sample.faults = sample.fault_phase = 1;
+        sample.fault_line = ctx->lines_consumed;
+        sample.fault_thread = (uint32_t)-1;
+        sample.scan_us = epd_lcd_get_scan_time_us();
+        sample.eof_gap_us = gap;
+        sample.eof_work_us = work;
+        sample.pixel_clock_hz = epd_lcd_get_pixel_clock_hz();
+        epd_metrics_add(&sample);
     }
-
-    free(ctx->static_line_buffer);
-    ctx->static_line_buffer = NULL;
 }
 
 #define int_min(a, b) (((a) < (b)) ? (a) : (b))
