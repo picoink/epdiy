@@ -1,6 +1,19 @@
 #pragma once
 
 #include "../output_common/render_context.h"
+#ifndef EPD_LCD_FULL_PHASE
+#define EPD_LCD_FULL_PHASE 0
+#endif
+
+// One spare ring slot, with enough capacity for the S31 IRQ-core row skew.
+// Full-phase publication removes the scan's dependence on feeder scheduling.
+static inline int epd_lcd_phase_queue_capacity(int lines) {
+    int capacity = (lines + NUM_RENDER_THREADS - 1) / NUM_RENDER_THREADS + 1;
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+    capacity += (lines + 15) / 16;
+#endif
+    return capacity;
+}
 
 /**
  * Lighten / darken picels using the LCD driving method.

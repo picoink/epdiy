@@ -412,7 +412,10 @@ void epd_renderer_init(enum EpdInitOptions options) {
     }
     // 127 usable slots per feeder hold 125 prefilled rows plus scan jitter.
     queue_len = max(queue_len, 128);
-    ESP_LOGD("epd", "line queue len=%d threads=%d (stream prefill)", queue_len, NUM_RENDER_THREADS);
+#if defined(RENDER_METHOD_LCD) && EPD_LCD_FULL_PHASE
+    queue_len = max(queue_len, epd_lcd_phase_queue_capacity(scan_display_height()));
+#endif
+    ESP_LOGD("epd", "line queue len=%d threads=%d", queue_len, NUM_RENDER_THREADS);
 
     if (render_context.conversion_lut == NULL) {
         ESP_LOGE("epd", "could not allocate line mask!");

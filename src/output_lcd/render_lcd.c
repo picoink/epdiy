@@ -201,7 +201,7 @@ void lcd_do_update(RenderContext_t* ctx) {
         ctx->line_threads[row]=(uint8_t)(row%NUM_RENDER_THREADS);
 #if defined(CONFIG_IDF_TARGET_ESP32S31)
         // The DMA/LCD IRQ consumes part of one core's time. Give the other
-        // core two extra rows per 16, while retaining 125 queued rows on BOTH.
+        // core two extra rows per 16 when preparing alongside the prior scan.
         if (row%16>=14) ctx->line_threads[row]=1-epd_lcd_get_irq_core();
 #endif
     }
@@ -296,7 +296,7 @@ failed:
         ESP_LOGE("epd_lcd","stream fault reason=%d phase=%d/%d line=%d/%d owner=%d ready=%d q0=%d/%d q1=%d/%d prefill=%d eof_gap=%dus eof_work=%dus",
             ctx->fault_reason,ctx->fault_phase,ctx->cycle_frames,ctx->fault_line,ctx->lines_total,
             ctx->fault_thread,ctx->fault_ready,ctx->fault_write[0],ctx->fault_read[0],
-            ctx->fault_write[1],ctx->fault_read[1],s_prefill_per_thread*NUM_RENDER_THREADS,eof_gap,eof_work);
+            ctx->fault_write[1],ctx->fault_read[1],EPD_LCD_FULL_PHASE ? ctx->lines_total : s_prefill_per_thread*NUM_RENDER_THREADS,eof_gap,eof_work);
     }
     for (int i=0;i<NUM_RENDER_THREADS;++i) lq_reset(&ctx->line_queues[i]);
 
@@ -467,7 +467,8 @@ static uint8_t* IRAM_ATTR wait_line_buffer(RenderContext_t* ctx,LineQueue_t* que
     }
 }
 
-// Prefill 125 rows per 127-slot queue before enabling the faster native scan.
+// A full-phase queue publishes only after every owned row is immutable. Radio
+// interrupts may delay preparation but cannot starve a running panel scan.
 __attribute__((optimize("O3"))) void IRAM_ATTR
 lcd_calculate_frame(RenderContext_t* ctx, int thread_id) {
     assert(ctx->lut_lookup_func != NULL);
@@ -487,13 +488,18 @@ lcd_calculate_frame(RenderContext_t* ctx, int thread_id) {
 
     assert(area.width == ctx->display_width && area.x == 0 && !ctx->error);
 
+#if EPD_LCD_FULL_PHASE
+    const int prefill_rows = ctx->lines_total;
+    assert(lq->size >= epd_lcd_phase_queue_capacity(ctx->lines_total));
+#else
     const int prefill_rows = int_min(s_prefill_per_thread,lq->size-1);
+#endif
     bool prefill_sent=false;
     int prefill_last=-1;
     for (int row=0,count=0;row<ctx->lines_total && count<prefill_rows;++row)
         if (ctx->line_threads[row]==thread_id) { prefill_last=row; ++count; }
 
-    // Fixed ownership bounds each producer to 125 prefill slots.
+    // Fixed ownership keeps current and upcoming phase rows in FIFO order.
     for (l=0; l<ctx->lines_total; ++l) {
         if (ctx->line_threads[l]!=thread_id) continue;
         if (atomic_load_explicit(&ctx->feed_cancelled, memory_order_acquire)) return;

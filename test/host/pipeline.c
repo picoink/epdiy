@@ -43,6 +43,13 @@ static pthread_t scanner;static bool scan_joinable;
 static line_cb_func_t source;static frame_done_func_t done;static void *source_ctx,*done_ctx;
 static int test_fault;static int64_t scan_at,last_scan;
 static bool clearing;static unsigned clear_drive;
+static bool delay_feeder;
+static _Thread_local unsigned prepared_rows;
+static lut_func_t real_lookup;
+static void delayed_lookup(const uint32_t* data,uint8_t* output,const uint8_t* lut,uint32_t width) {
+ if(delay_feeder && ++prepared_rows==150)usleep(110000);
+ real_lookup(data,output,lut,width);
+}
 void epd_lcd_line_source_cb(line_cb_func_t cb,void* p){source=cb;source_ctx=p;}
 void epd_lcd_frame_done_cb(frame_done_func_t cb,void* p){done=cb;done_ctx=p;}
 void epd_lcd_get_stream_stats(int* a,int* b){*a=*b=0;}
@@ -89,6 +96,10 @@ static void* scan_run(void* p) {
 void epd_lcd_start_frame(void){
  if(scan_joinable){pthread_join(scanner,0);scan_joinable=false;}
  atomic_store(&abort_scan,false);++scans;
+#if EPD_LCD_FULL_PHASE
+ if(!clearing){RenderContext_t* ctx=source_ctx;for(int y=0;y<ctx->lines_total;++y)
+  assert(__atomic_load_n(&ctx->line_ready[y],__ATOMIC_ACQUIRE)>=ctx->scan_frame+1);}
+#endif
  assert(pthread_create(&scanner,0,scan_run,source_ctx)==0);scan_joinable=true;
 }
 void epd_lcd_abort_frame(void){atomic_store(&abort_scan,true);if(scan_joinable){pthread_join(scanner,0);scan_joinable=false;}}
@@ -98,7 +109,7 @@ static void* feed_run(void* p){
   if(atomic_load(&quit))break;
   ++feeder_active;
   if(t->ctx->current_frame>t->ctx->scan_frame)++overlap;
-  lcd_calculate_frame(t->ctx,t->id);
+  prepared_rows=0;lcd_calculate_frame(t->ctx,t->id);
   --feeder_active;
   xSemaphoreGive(t->ctx->feed_done_smphr[t->id]);
  }
@@ -125,15 +136,16 @@ int main(void){
  EpdWaveformMode mode={MODE_GL16,1,range};const EpdWaveformMode* modes[]={&mode};
  EpdWaveform wf={1,1,modes,0};ctx.waveform=&wf;
  LutFunctionPair pair=find_lut_functions(ctx.mode,1024);ctx.lut_lookup_func=pair.lookup_func;ctx.lut_build_func=pair.build_func;
- assert(pair.lookup_func && pair.build_func);
+ assert(pair.lookup_func && pair.build_func);real_lookup=pair.lookup_func;ctx.lut_lookup_func=delayed_lookup;
  ctx.line_ready=calloc(684,1);ctx.line_threads=calloc(684,1);ctx.line_mask=calloc(16,1);
  ctx.prefill_done=xSemaphoreCreateCounting(2,0);ctx.frame_done=xSemaphoreCreateBinary();
  struct HostTask tasks[2];
- for(int i=0;i<2;++i){ctx.line_queues[i]=lq_init(128,16);ctx.feed_done_smphr[i]=xSemaphoreCreateBinary();ctx.feed_space[i]=xSemaphoreCreateBinary();tasks[i]=(struct HostTask){.notify=xSemaphoreCreateBinary(),.ctx=&ctx,.id=i};ctx.feed_tasks[i]=&tasks[i];pthread_create(&tasks[i].thread,0,feed_run,&tasks[i]);}
+ for(int i=0;i<2;++i){ctx.line_queues[i]=lq_init(EPD_LCD_FULL_PHASE ? epd_lcd_phase_queue_capacity(ctx.lines_total):128,16);ctx.feed_done_smphr[i]=xSemaphoreCreateBinary();ctx.feed_space[i]=xSemaphoreCreateBinary();tasks[i]=(struct HostTask){.notify=xSemaphoreCreateBinary(),.ctx=&ctx,.id=i};ctx.feed_tasks[i]=&tasks[i];pthread_create(&tasks[i].thread,0,feed_run,&tasks[i]);}
  // Repeat after both failure types: no old phase, callback, queue, or semaphore can leak.
  int scenarios[]={0,1,0,2,0,0};
  for(unsigned t=0;t<sizeof(scenarios)/sizeof(*scenarios);++t){
   test_fault=scenarios[t];irq_core=t%2;ctx.error=0;ctx.current_frame=0;epd_metrics_reset();
+  delay_feeder=EPD_LCD_FULL_PHASE && t==5;
   lcd_do_update(&ctx);epd_lcd_abort_frame();
   EpdMetrics m=epd_metrics_get();assert(!atomic_load(&feeder_active));
   assert((ctx.error!=0)==(test_fault!=0));assert(m.faults==(test_fault!=0));
