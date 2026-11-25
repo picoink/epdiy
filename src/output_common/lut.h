@@ -45,3 +45,8 @@ void epd_apply_line_mask(uint8_t* buf, const uint8_t* mask, int len);
 // legacy functions
 void bit_shift_buffer_right(uint8_t* buf, uint32_t len, int shift);
 void nibble_shift_buffer_right(uint8_t* buf, uint32_t len);
+
+// Pack four-gray targets in place after dirty rows/columns have been computed.
+void epd_compact_gl4_difference(uint8_t* data, uint32_t pixels);
+
+EpdRect epd_difference_image_compact(const uint8_t*,const uint8_t*,EpdRect,uint8_t*,bool*,uint8_t*);

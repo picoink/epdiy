@@ -116,6 +116,7 @@ static void* feed_run(void* p){
  return 0;
 }
 uint32_t epd_interlace_4bpp_line_VE(const uint8_t*,const uint8_t*,uint8_t*,uint8_t*,int);
+uint32_t epd_interlace_gl4_line(const uint8_t*,const uint8_t*,uint8_t*,uint8_t*,int);
 int main(void){
  // Independent scalar checks include odd widths, tails and unaligned buffers.
  for (int width=1;width<=1216;++width) {
@@ -127,10 +128,46 @@ int main(void){
   assert((got!=0)==(changed!=0));assert(!memcmp(diff+1,expected,width));assert(!memcmp(dirty,columns,610));
  }
 
+ // Exhaust all 4 x 16 transitions for each pair. The second pair exercises
+ // high output bits independently, including unchanged and white transitions.
+ uint8_t pair_lut[4096],pair_wave[64];
+ for(unsigned i=0;i<64;++i)pair_wave[i]=(i*137+i/11)&255;
+ EpdWaveformPhases pair_phase={1,pair_wave,0};
+ for(unsigned skip=0;skip<2;++skip) {
+  enum EpdDrawMode packed_mode=MODE_GL16|MODE_PACKING_1PPB_DIFFERENCE|MODE_GL4_COMPACT|(skip?MODE_SKIP_UNCHANGED:0);
+  LutFunctionPair packed=find_lut_functions(packed_mode,4096);
+  assert(packed.build_func && packed.lookup_func);
+  assert(!find_lut_functions(packed_mode,1024).lookup_func);
+  packed.build_func(pair_lut,&pair_phase,0);
+  for(unsigned a=0;a<64;++a)for(unsigned b=0;b<64;++b) {
+   uint32_t words[4];uint8_t original[16],actual[4],expected[4]={0};
+   for(unsigned k=0;k<16;++k) {
+    unsigned code=k%2?b:a;code=(code+k/2*13)&63;
+    unsigned to=(code>>4)*5,from=code&15;original[k]=(to<<4)|from;
+    unsigned drive=(skip && to==from)?0:((pair_wave[to*4+from/4]>>(6-2*(from&3)))&3);
+    expected[k/4]|=drive<<(6-2*(k%4));
+   }
+   uint8_t target[8],previous[8],columns[8]={0},reference_columns[8];uint32_t fused[4];
+   for(unsigned k=0;k<8;++k) {
+    target[k]=(original[2*k]>>4)|(original[2*k+1]&0xf0);
+    previous[k]=(original[2*k]&15)|(original[2*k+1]<<4);
+    reference_columns[k]=target[k]^previous[k];
+   }
+   epd_interlace_gl4_line(target,previous,(uint8_t*)fused,columns,16);
+   assert(!memcmp(columns,reference_columns,8));
+   memcpy(words,original,16);epd_compact_gl4_difference((uint8_t*)words,16);
+   assert(!memcmp(words,fused,16));
+   packed.lookup_func(words,actual,pair_lut,16);assert(!memcmp(actual,expected,4));
+   packed.lookup_func(words,actual,pair_lut,4);assert(actual[0]==expected[0]);
+  }
+ }
+
  RenderContext_t ctx={0};ctx.display_width=64;ctx.display_height=ctx.lines_total=684;
  ctx.area=ctx.crop_to=(EpdRect){0,0,64,684};ctx.mode=MODE_GL16|MODE_PACKING_1PPB_DIFFERENCE;
  ctx.cycle_frames=5;ctx.conversion_lut=calloc(1,1024);
  uint8_t* data=malloc(64*684);for(int i=0;i<64*684;++i)data[i]=(i*71+i/7)&255;ctx.data_ptr=data;
+ // Exercise long white runs beside mixed transitions through every waveform.
+ for(int row=0;row<684;row+=3)memset(data+row*64,255,32);
  for(unsigned i=0;i<sizeof(phases);++i)phases[i]=(i*137+i/11)&255;
  EpdWaveformPhases ph={5,phases,0};const EpdWaveformPhases* range[]={&ph};
  EpdWaveformMode mode={MODE_GL16,1,range};const EpdWaveformMode* modes[]={&mode};

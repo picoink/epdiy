@@ -70,6 +70,23 @@ __attribute__((optimize("O3"))) uint32_t epd_interlace_4bpp_line_VE(
     return dirty;
 }
 
+// S31 GL4 targets need only two bits; retain four previous-gray bits per
+// pixel. Generate the compact pairs while reading the two original frames.
+__attribute__((optimize("O3"))) uint32_t epd_interlace_gl4_line(
+    const uint8_t* to,const uint8_t* from,uint8_t* diff,uint8_t* columns,int width
+) {
+    uint32_t dirty=0;
+    for(int p=0;p<width/2;p+=2) {
+        uint16_t t,f,c;memcpy(&t,to+p,2);memcpy(&f,from+p,2);memcpy(&c,columns+p,2);
+        c|=t^f;memcpy(columns+p,&c,2);dirty|=t^f;
+        const uint32_t v=(f&15)|((t<<2)&0x30)|((f&0xf0)<<2)|((t&0xc0)<<4)|
+            ((uint32_t)(f&0xf00)<<8)|((uint32_t)(t&0xc00)<<10)|
+            ((uint32_t)(f&0xf000)<<10)|((uint32_t)(t&0xc000)<<12);
+        memcpy(diff+p*2,&v,4);
+    }
+    return dirty;
+}
+
 __attribute__((optimize("O3"))) void IRAM_ATTR
 epd_apply_line_mask_VE(uint8_t* line, const uint8_t* mask, int mask_len) {
     if (line == NULL || mask == NULL || mask_len <= 0) {
@@ -121,11 +138,20 @@ calc_epd_input_1ppB_1k_S3_VE_aligned(
                | lut[(((in) >> 8) & 0xFFu) << 2] << 2 | lut[((in) & 0xFFu) << 2]))
     #endif
 
+    // Reader margins and spaces are usually unchanged white. Reuse the exact
+    // waveform output for those runs, including modes that drive white-white.
+    const uint32_t white_output=(uint32_t)LUT4(UINT32_MAX)*0x01010101u;
     for (; j + 4 <= n; j += 4) {
-        const uint32_t in0 = ld[j];
-        const uint32_t in1 = ld[j + 1];
-        const uint32_t in2 = ld[j + 2];
-        const uint32_t in3 = ld[j + 3];
+        uint32_t in0 = ld[j];
+        uint32_t in1 = ld[j + 1];
+        uint32_t in2 = ld[j + 2];
+        uint32_t in3 = ld[j + 3];
+        if((in0 & in1 & in2 & in3)==UINT32_MAX) {
+            memcpy(epd_input+j,&white_output,4);continue;
+        }
+        // Keep LUT index expansion below the sparse-run branch. Otherwise GCC
+        // schedules all sixteen index calculations before testing for white.
+        __asm__ volatile("" : "+r"(in0), "+r"(in1), "+r"(in2), "+r"(in3));
         const uint32_t output=(uint32_t)LUT4(in0)|((uint32_t)LUT4(in1)<<8)|
             ((uint32_t)LUT4(in2)<<16)|((uint32_t)LUT4(in3)<<24);
         memcpy(epd_input+j,&output,4);

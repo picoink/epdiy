@@ -202,8 +202,9 @@ void lcd_do_update(RenderContext_t* ctx) {
         ctx->line_threads[row]=(uint8_t)(row%NUM_RENDER_THREADS);
 #if defined(CONFIG_IDF_TARGET_ESP32S31)
         // The DMA/LCD IRQ consumes part of one core's time. Give the other
-        // core two extra rows per 16 when preparing alongside the prior scan.
-        if (row%16>=14) ctx->line_threads[row]=1-epd_lcd_get_irq_core();
+        // core six extra rows per 32 when preparing alongside the prior scan.
+        // Hardware timings include the IRQ cost: 13:19 balances both feeders.
+        if (row%32>=26) ctx->line_threads[row]=1-epd_lcd_get_irq_core();
 #endif
     }
     atomic_store_explicit(&ctx->feed_cancelled,false,memory_order_release);

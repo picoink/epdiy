@@ -362,6 +362,8 @@ void epd_renderer_init(enum EpdInitOptions options) {
     size_t lut_size = 0;
     if (options & EPD_LUT_1K) {
         lut_size = 1 << 10;
+    } else if (options & EPD_LUT_4K) {
+        lut_size = 1 << 12;
     } else if (options & EPD_LUT_64K) {
         lut_size = 1 << 16;
     } else if (options == EPD_OPTIONS_DEFAULT) {
@@ -376,8 +378,13 @@ void epd_renderer_init(enum EpdInitOptions options) {
     }
 
     ESP_LOGI("epd", "Space used for waveform LUT: %dK", lut_size / 1024);
-    render_context.conversion_lut
-        = (uint8_t*)heap_caps_malloc(lut_size, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    uint32_t lut_caps = MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL;
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+    // INTERNAL also admits LP SRAM on S31. This lookup table is read for every
+    // driven pixel, so keep its small working set in the fast HP/DMA heap.
+    lut_caps |= MALLOC_CAP_DMA;
+#endif
+    render_context.conversion_lut = (uint8_t*)heap_caps_malloc(lut_size, lut_caps);
     if (render_context.conversion_lut == NULL) {
         ESP_LOGE("epd", "could not allocate LUT!");
         abort();
@@ -579,7 +586,10 @@ __attribute__((optimize("O3"))) bool _epd_interlace_line(
 #endif
 }
 
-EpdRect epd_difference_image_base(
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+uint32_t epd_interlace_gl4_line(const uint8_t*,const uint8_t*,uint8_t*,uint8_t*,int);
+#endif
+static EpdRect difference_image(
     const uint8_t* to,
     const uint8_t* from,
     EpdRect crop_to,
@@ -587,7 +597,7 @@ EpdRect epd_difference_image_base(
     int fb_height,
     uint8_t* interlaced,
     bool* dirty_lines,
-    uint8_t* col_dirtyness
+    uint8_t* col_dirtyness, bool compact
 ) {
     assert(fb_width % 8 == 0);
     assert(col_dirtyness != NULL);
@@ -606,7 +616,11 @@ EpdRect epd_difference_image_base(
 
     for (int y = crop_to.y; y < y_end; y++) {
         uint32_t offset = y * fb_width / 2;
-        int dirty = _epd_interlace_line(
+        int dirty;
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+        if(compact)dirty=epd_interlace_gl4_line(to+offset,from+offset,interlaced+offset*2,col_dirtyness,fb_width);else
+#endif
+        dirty = _epd_interlace_line(
             to + offset, from + offset, interlaced + offset * 2, col_dirtyness, fb_width
         );
         dirty_lines[y] = dirty;
@@ -640,6 +654,15 @@ EpdRect epd_difference_image_base(
     };
 
     return crop_rect;
+}
+
+EpdRect epd_difference_image_base(const uint8_t* to,const uint8_t* from,EpdRect crop,
+    int width,int height,uint8_t* diff,bool* rows,uint8_t* columns) {
+    return difference_image(to,from,crop,width,height,diff,rows,columns,false);
+}
+EpdRect epd_difference_image_compact(const uint8_t* to,const uint8_t* from,EpdRect crop,
+    uint8_t* diff,bool* rows,uint8_t* columns) {
+    return difference_image(to,from,crop,epd_width(),epd_height(),diff,rows,columns,true);
 }
 
 EpdRect epd_difference_image(

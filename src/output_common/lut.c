@@ -498,12 +498,58 @@ static void IRAM_ATTR build_du_1ppB_lut_64k(
     build_1ppB_lut_64k(lut, &phase, 0);
 }
 
+// Every target is 0, 5, 10 or 15. Previous pixels retain all sixteen levels,
+// including the first GL4 turn after a GL16 illustration or cleaning refresh.
+__attribute__((optimize("O3"))) void epd_compact_gl4_difference(uint8_t* data, uint32_t pixels) {
+    for (uint32_t i=0; i+4<=pixels; i+=4) {
+        uint32_t v; memcpy(&v,data+i,4);
+        v=(v&0x000f000fu)|((v>>2)&0x03f003f0u)|((v>>4)&0x0c000c00u);
+        memcpy(data+i,&v,4);
+    }
+}
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+static void IRAM_ATTR build_gl4_pair_lut(uint8_t* lut, const EpdWaveformPhases* phases, int frame) {
+    uint8_t drives[64]; const uint8_t* wave=phases->luts+64*frame;
+    for (unsigned i=0;i<64;++i) {
+        unsigned to=(i>>4)*5,from=i&15;
+        drives[i]=(wave[to*4+from/4]>>(6-2*(from&3)))&3;
+    }
+    for (unsigned b=0;b<64;++b)for(unsigned a=0;a<64;++a)
+        lut[a|(b<<6)]=(drives[a]<<2)|drives[b];
+}
+static void IRAM_ATTR build_changed_gl4_pair_lut(uint8_t* lut, const EpdWaveformPhases* phases, int frame) {
+    uint8_t data[16][4]; changed_only_phase(data,phases,frame,false);
+    EpdWaveformPhases phase=*phases;phase.luts=(const uint8_t*)data;
+    build_gl4_pair_lut(lut,&phase,0);
+}
+__attribute__((optimize("O3"))) static void IRAM_ATTR calc_gl4_pair_input(
+    const uint32_t* data,uint8_t* output,const uint8_t* lut,uint32_t width
+) {
+    const uint32_t n=width/4;uint32_t j=0;
+    for(;j+4<=n;j+=4) {
+        uint32_t a=data[j],b=data[j+1],c=data[j+2],d=data[j+3];
+        #define PAIR(v) ((uint32_t)(lut[(v)&4095]<<4)|lut[((v)>>16)&4095])
+        uint32_t result=PAIR(a)|(PAIR(b)<<8)|(PAIR(c)<<16)|(PAIR(d)<<24);
+        memcpy(output+j,&result,4);
+    }
+    for(;j<n;++j)output[j]=PAIR(data[j]);
+    #undef PAIR
+}
+#endif
+
 LutFunctionPair find_lut_functions(enum EpdDrawMode mode, uint32_t lut_size) {
     LutFunctionPair pair;
     pair.build_func = NULL;
     pair.lookup_func = NULL;
 
     if (mode & MODE_PACKING_1PPB_DIFFERENCE) {
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+        if (mode & MODE_GL4_COMPACT) {
+            if(lut_size<4096)return pair;
+            pair.build_func=mode & MODE_SKIP_UNCHANGED ? build_changed_gl4_pair_lut : build_gl4_pair_lut;
+            pair.lookup_func=calc_gl4_pair_input;return pair;
+        }
+#endif
         if (EPD_CURRENT_RENDER_METHOD == RENDER_METHOD_LCD && !(mode & MODE_FORCE_NO_PIE)
             && lut_size >= 1024) {
             pair.build_func = mode & MODE_SKIP_UNCHANGED

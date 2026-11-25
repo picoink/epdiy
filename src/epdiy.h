@@ -43,6 +43,8 @@ enum EpdInitOptions {
     /// Use a feed queue of 32 display lines. (default)
     /// Best performance, but larger memory footprint.
     EPD_FEED_QUEUE_32 = 8,
+    /// S31 compact four-gray transitions; retains arbitrary previous gray levels.
+    EPD_LUT_4K = 16,
 };
 
 /// The image drawing mode.
@@ -117,6 +119,8 @@ enum EpdDrawMode {
     // 普通差分刷新屏蔽同色驱动，DU 允许保留黑→黑补黑。
     // 全刷、恢复、测试及调理动画不使用此标记。
     MODE_SKIP_UNCHANGED = 0x8000,
+    /// Four-gray target; high-level API compacts each pair into twelve bits.
+    MODE_GL4_COMPACT = 0x10000,
 };
 
 /** Display software rotation.
