@@ -175,6 +175,21 @@ static bool wait_feeders(RenderContext_t* ctx, unsigned* active) {
     return true;
 }
 
+static bool repeats_previous_phase(const RenderContext_t* ctx, int phase) {
+#if EPD_LCD_FULL_PHASE
+    // A complete immutable phase remains in the queue after consumption. Exact
+    // waveform equality permits replaying those bytes, including all masks and
+    // cropping. Spatial wipes vary by phase even when the source LUT is equal.
+    if (phase > 0 && !ctx->spatial_luts) {
+        const EpdWaveformPhases* phases = ctx->waveform->mode_data[ctx->waveform_index]
+            ->range_data[ctx->waveform_range];
+        return phases && phases->luts && phase < phases->phases &&
+            !memcmp(phases->luts + 64 * (phase - 1), phases->luts + 64 * phase, 64);
+    }
+#endif
+    return false;
+}
+
 void lcd_do_update(RenderContext_t* ctx) {
     if (ctx->cycle_frames<=0) return;
     if (s_scan_lock == NULL) {
@@ -194,6 +209,7 @@ void lcd_do_update(RenderContext_t* ctx) {
     int64_t scan_total=0;
     int scan_min=INT32_MAX,scan_max=0,eof_gap_max=0,eof_work_max=0;
     unsigned active=0;
+    bool replay=false;
     ctx->fault_reason=0;
     ctx->fault_phase=ctx->fault_line=ctx->fault_thread=0;
     ctx->scan_frame=0;
@@ -218,7 +234,7 @@ void lcd_do_update(RenderContext_t* ctx) {
     notify_feeders(ctx);
     for (int k=0;k<ctx->cycle_frames;++k) {
         stage_at=esp_timer_get_time();
-        for (int i=0;i<NUM_RENDER_THREADS;++i) {
+        for (int i=0;!replay && i<NUM_RENDER_THREADS;++i) {
             if (xSemaphoreTake(ctx->prefill_done,pdMS_TO_TICKS(2000))!=pdTRUE) {
                 ESP_LOGE("epd_lcd","prefill timeout @frame %d",k+1);
                 ctx->error|=EPD_DRAW_EMPTY_LINE_QUEUE;
@@ -243,6 +259,9 @@ void lcd_do_update(RenderContext_t* ctx) {
         previous_phase_start=phase_start;
         ctx->scan_frame=k;
         ctx->lines_consumed=0;
+        int phase_start_row[NUM_RENDER_THREADS];
+        for(int i=0;i<NUM_RENDER_THREADS;++i)
+            phase_start_row[i]=atomic_load_explicit(&ctx->line_queues[i].last,memory_order_acquire);
         epd_lcd_frame_done_cb((frame_done_func_t)handle_lcd_frame_done,ctx);
         stage_at=esp_timer_get_time();
         if (!start_scan(ctx)) goto failed;
@@ -253,13 +272,16 @@ void lcd_do_update(RenderContext_t* ctx) {
         if (!wait_feeders(ctx,&active)) goto failed;
         feed_wait_us+=esp_timer_get_time()-stage_at;
         if (ctx->error) goto failed;
+        const bool replay_next=k+1<ctx->cycle_frames && repeats_previous_phase(ctx,k+1);
         if (k+1<ctx->cycle_frames) {
             ctx->current_frame=k+1;
             stage_at=esp_timer_get_time();
             prepare_context_for_next_frame(ctx);
             lut_us+=esp_timer_get_time()-stage_at;
-            active=(1u<<NUM_RENDER_THREADS)-1;
-            notify_feeders(ctx);
+            if(!replay_next) {
+                active=(1u<<NUM_RENDER_THREADS)-1;
+                notify_feeders(ctx);
+            }
         }
 
         stage_at=esp_timer_get_time();
@@ -270,6 +292,16 @@ void lcd_do_update(RenderContext_t* ctx) {
             goto failed;
         }
         if (ctx->error) goto failed;
+
+        if(replay_next) {
+            // No producer was started. Only rewind after the prior ISR has
+            // completed; the immutable rows then become the next full prefill.
+            for(int i=0;i<NUM_RENDER_THREADS;++i)
+                atomic_store_explicit(&ctx->line_queues[i].last,phase_start_row[i],memory_order_release);
+            for(int row=0;row<ctx->lines_total;++row)
+                __atomic_store_n(&ctx->line_ready[row],k+2,__ATOMIC_RELEASE);
+        }
+        replay=replay_next;
 
         frame_wait_us+=esp_timer_get_time()-stage_at;
         ++completed_frames;

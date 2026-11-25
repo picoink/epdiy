@@ -11,7 +11,7 @@ const enum EpdRenderMethod EPD_CURRENT_RENDER_METHOD=RENDER_METHOD_LCD;
 static _Thread_local bool in_isr;
 static _Thread_local int core;
 static atomic_bool quit, abort_scan;
-static atomic_int feeder_active, overlap, scans;
+static atomic_int feeder_active, overlap, scans, preparations;
 struct HostTask { pthread_t thread; SemaphoreHandle_t notify; RenderContext_t* ctx; int id; };
 int64_t esp_timer_get_time(void) { struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1000000LL+t.tv_nsec/1000; }
 SemaphoreHandle_t xSemaphoreCreateMutexStatic(StaticSemaphore_t* s) {
@@ -63,7 +63,7 @@ static void* scan_run(void* p) {
  RenderContext_t* ctx=p;in_isr=true;scan_at=esp_timer_get_time();
  unsigned phase=ctx->scan_frame;uint8_t row[16];
  for(int y=0;y<ctx->lines_total && !atomic_load(&abort_scan);++y){
-  if(test_fault==1 && y==16) break; // Incomplete LCD scan.
+  if((test_fault==1 || (test_fault==3 && (clearing || phase==1))) && y==16) break; // Including a replayed phase.
   if(test_fault==2 && y==16){while(!atomic_load(&abort_scan))usleep(100);break;} // Lost completion.
   source(source_ctx,row);
   if(clearing) {
@@ -108,6 +108,7 @@ static void* feed_run(void* p){
  while(xSemaphoreTake(t->notify,portMAX_DELAY)){
   if(atomic_load(&quit))break;
   ++feeder_active;
+  ++preparations;
   if(t->ctx->current_frame>t->ctx->scan_frame)++overlap;
   prepared_rows=0;lcd_calculate_frame(t->ctx,t->id);
   --feeder_active;
@@ -169,6 +170,9 @@ int main(void){
  // Exercise long white runs beside mixed transitions through every waveform.
  for(int row=0;row<684;row+=3)memset(data+row*64,255,32);
  for(unsigned i=0;i<sizeof(phases);++i)phases[i]=(i*137+i/11)&255;
+ // First three phases are identical; a later different phase must still be
+ // prepared and verified pixel-for-pixel after the replayed queue wraps.
+ memcpy(phases+64,phases,64);memcpy(phases+128,phases,64);
  EpdWaveformPhases ph={5,phases,0};const EpdWaveformPhases* range[]={&ph};
  EpdWaveformMode mode={MODE_GL16,1,range};const EpdWaveformMode* modes[]={&mode};
  EpdWaveform wf={1,1,modes,0};ctx.waveform=&wf;
@@ -179,14 +183,15 @@ int main(void){
  struct HostTask tasks[2];
  for(int i=0;i<2;++i){ctx.line_queues[i]=lq_init(EPD_LCD_FULL_PHASE ? epd_lcd_phase_queue_capacity(ctx.lines_total):128,16);ctx.feed_done_smphr[i]=xSemaphoreCreateBinary();ctx.feed_space[i]=xSemaphoreCreateBinary();tasks[i]=(struct HostTask){.notify=xSemaphoreCreateBinary(),.ctx=&ctx,.id=i};ctx.feed_tasks[i]=&tasks[i];pthread_create(&tasks[i].thread,0,feed_run,&tasks[i]);}
  // Repeat after both failure types: no old phase, callback, queue, or semaphore can leak.
- int scenarios[]={0,1,0,2,0,0};
+ int scenarios[]={0,1,0,2,0,0,3,0};
  for(unsigned t=0;t<sizeof(scenarios)/sizeof(*scenarios);++t){
   test_fault=scenarios[t];irq_core=t%2;ctx.error=0;ctx.current_frame=0;epd_metrics_reset();
   delay_feeder=EPD_LCD_FULL_PHASE && t==5;
+  atomic_store(&preparations,0);
   lcd_do_update(&ctx);epd_lcd_abort_frame();
   EpdMetrics m=epd_metrics_get();assert(!atomic_load(&feeder_active));
   assert((ctx.error!=0)==(test_fault!=0));assert(m.faults==(test_fault!=0));
-  if(!test_fault){assert(m.completed==5);assert(m.pixel_clock_hz==20000000);assert(!m.fault_phase && !m.fault_line && !m.fault_thread);}
+  if(!test_fault){assert(m.completed==5);assert(m.pixel_clock_hz==20000000);assert(!m.fault_phase && !m.fault_line && !m.fault_thread);assert(atomic_load(&preparations)==(EPD_LCD_FULL_PHASE?6:10));}
   for(int i=0;i<2;++i){assert(atomic_load(&ctx.line_queues[i].current)==atomic_load(&ctx.line_queues[i].last));assert(!atomic_load(&ctx.feed_waiting[i]));}
  }
  // The clear ISR must reuse its reserved row across colors, cropped regions,
