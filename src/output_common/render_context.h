@@ -38,6 +38,7 @@ typedef struct {
     int fault_write[NUM_RENDER_THREADS],fault_read[NUM_RENDER_THREADS];
 
     TaskHandle_t feed_tasks[NUM_RENDER_THREADS];
+    uint32_t feed_time_us[NUM_RENDER_THREADS];
     SemaphoreHandle_t feed_done_smphr[NUM_RENDER_THREADS];
     SemaphoreHandle_t feed_space[NUM_RENDER_THREADS]; // 队列满时阻塞供数，避免占住更新任务所在内核。
     atomic_bool feed_waiting[NUM_RENDER_THREADS]; // 满队列等待已发布，供 ISR 选择性唤醒。

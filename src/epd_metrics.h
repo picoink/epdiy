@@ -10,6 +10,7 @@ typedef struct {
     uint32_t scan_us;
     uint32_t lut_us;
     uint32_t feed_wait_us;
+    uint32_t start_us, frame_wait_us, pace_us, feed0_us, feed1_us;
     uint32_t phase_avg_us;
     uint32_t phase_min_us;
     uint32_t phase_max_us;

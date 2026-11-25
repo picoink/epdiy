@@ -293,7 +293,9 @@ static void IRAM_ATTR render_thread(void* arg) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
 #ifdef RENDER_METHOD_LCD
+        const int64_t feed_started = esp_timer_get_time();
         lcd_calculate_frame(&render_context, thread_id);
+        render_context.feed_time_us[thread_id] += esp_timer_get_time() - feed_started;
 #elif defined(RENDER_METHOD_I2S)
         if (thread_id == 0) {
             i2s_fetch_frame_data(&render_context, thread_id);

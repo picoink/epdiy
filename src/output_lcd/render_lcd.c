@@ -182,7 +182,8 @@ void lcd_do_update(RenderContext_t* ctx) {
         assert(s_scan_lock != NULL);
     }
     const int64_t cycle_start=esp_timer_get_time();
-    uint32_t lut_us=0, feed_wait_us=0;
+    uint32_t lut_us=0, feed_wait_us=0, start_us=0, frame_wait_us=0, pace_us=0;
+    memset(ctx->feed_time_us,0,sizeof(ctx->feed_time_us));
     int64_t stage_at=esp_timer_get_time();
     int64_t phase_origin=0;
     int64_t previous_phase_start=0, period_total=0;
@@ -228,7 +229,9 @@ void lcd_do_update(RenderContext_t* ctx) {
         if (k==0) phase_origin=esp_timer_get_time();
         const int64_t deadline=phase_origin+
             ((int64_t)k*1000000+EPD_PHASE_HZ-1)/EPD_PHASE_HZ;
+        stage_at=esp_timer_get_time();
         pace_phase(deadline);
+        pace_us+=esp_timer_get_time()-stage_at;
         const int64_t phase_start=esp_timer_get_time();
         if (previous_phase_start) {
             const int period=(int)(phase_start-previous_phase_start);
@@ -240,7 +243,9 @@ void lcd_do_update(RenderContext_t* ctx) {
         ctx->scan_frame=k;
         ctx->lines_consumed=0;
         epd_lcd_frame_done_cb((frame_done_func_t)handle_lcd_frame_done,ctx);
+        stage_at=esp_timer_get_time();
         if (!start_scan(ctx)) goto failed;
+        start_us+=esp_timer_get_time()-stage_at;
 
         // 供数结束后，ISR 仅持有队列数据；尾部扫描时可复用 LUT 准备下一相。
         stage_at=esp_timer_get_time();
@@ -256,6 +261,7 @@ void lcd_do_update(RenderContext_t* ctx) {
             notify_feeders(ctx);
         }
 
+        stage_at=esp_timer_get_time();
         if (xSemaphoreTake(ctx->frame_done,pdMS_TO_TICKS(2000))!=pdTRUE) {
             ESP_LOGE("epd_lcd","LCD frame %d/%d timeout err=0x%x consumed=%d/%d",
                 k+1,ctx->cycle_frames,ctx->error,ctx->lines_consumed,ctx->lines_total);
@@ -264,6 +270,7 @@ void lcd_do_update(RenderContext_t* ctx) {
         }
         if (ctx->error) goto failed;
 
+        frame_wait_us+=esp_timer_get_time()-stage_at;
         ++completed_frames;
         const int64_t spv_start=epd_lcd_get_spv_start_us();
         if (previous_spv_start) {
@@ -311,6 +318,8 @@ finished:
 
     EpdMetrics sample={0};
     sample.cycle_us=esp_timer_get_time()-cycle_start; sample.scan_us=scan_total;
+    sample.start_us=start_us; sample.frame_wait_us=frame_wait_us; sample.pace_us=pace_us;
+    sample.feed0_us=ctx->feed_time_us[0];sample.feed1_us=ctx->feed_time_us[1];
     sample.lut_us=lut_us; sample.feed_wait_us=feed_wait_us;
     sample.phases=ctx->cycle_frames; sample.completed=completed_frames;
     sample.fault_phase=ctx->fault_phase;
