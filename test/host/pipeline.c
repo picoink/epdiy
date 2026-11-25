@@ -42,6 +42,13 @@ void epd_set_mode(bool mode){(void)mode;}
 static pthread_t scanner;static bool scan_joinable;
 static line_cb_func_t source;static frame_done_func_t done;static void *source_ctx,*done_ctx;
 static int test_fault;static int64_t scan_at,last_scan;
+static bool direct_phase, direct_data_complete,phase_prepared;
+static unsigned active_phase;
+static atomic_bool scanning;
+static atomic_uint packing_overlap;
+static uint8_t cached_phase[2][684][16];
+bool epd_lcd_has_phase_buffer(void){return direct_phase;}
+bool epd_lcd_frame_data_complete(void){return !direct_phase || direct_data_complete;}
 static bool clearing;static unsigned clear_drive;
 static bool delay_feeder;
 static _Thread_local unsigned prepared_rows;
@@ -60,12 +67,12 @@ static int irq_core=1;
 int epd_lcd_get_irq_core(void){return irq_core;}
 static uint8_t phases[5*64];
 static void* scan_run(void* p) {
- RenderContext_t* ctx=p;in_isr=true;scan_at=esp_timer_get_time();
- unsigned phase=ctx->scan_frame;uint8_t row[16];
+ RenderContext_t* ctx=p;in_isr=true;scan_at=esp_timer_get_time();scanning=true;
+ unsigned phase=ctx->scan_frame,scanned=0;uint8_t row[16];
  for(int y=0;y<ctx->lines_total && !atomic_load(&abort_scan);++y){
   if((test_fault==1 || (test_fault==3 && (clearing || phase==1))) && y==16) break; // Including a replayed phase.
   if(test_fault==2 && y==16){while(!atomic_load(&abort_scan))usleep(100);break;} // Lost completion.
-  source(source_ctx,row);
+  if(direct_phase)memcpy(row,cached_phase[active_phase][y],sizeof(row));else source(source_ctx,row);
   if(clearing) {
    for(unsigned x=0;x<sizeof(row);++x) {
     unsigned expected=0;
@@ -87,22 +94,32 @@ static void* scan_run(void* p) {
    if(!test_fault)assert(row[x]==expected);
   }
   }
-  usleep(50);
+  ++scanned;usleep(50);
  }
+ direct_data_complete=scanned==ctx->lines_total;scanning=false;
  last_scan=esp_timer_get_time()-scan_at;
  if(!atomic_load(&abort_scan) && done)done(done_ctx);
  return 0;
 }
-void epd_lcd_start_frame(void){
+void epd_lcd_prepare_frame(line_cb_func_t read,void* payload) {
+ if(scanning)++packing_overlap;
+ for(unsigned y=0;y<684;++y)read(payload,cached_phase[1-active_phase][y]);
+ phase_prepared=true;
+}
+void epd_lcd_start_frame(bool reuse_phase){
  if(scan_joinable){pthread_join(scanner,0);scan_joinable=false;}
  atomic_store(&abort_scan,false);++scans;
 #if EPD_LCD_FULL_PHASE
- if(!clearing){RenderContext_t* ctx=source_ctx;for(int y=0;y<ctx->lines_total;++y)
+ if(!clearing && !(direct_phase && reuse_phase)){RenderContext_t* ctx=source_ctx;for(int y=0;y<ctx->lines_total;++y)
   assert(__atomic_load_n(&ctx->line_ready[y],__ATOMIC_ACQUIRE)>=ctx->scan_frame+1);}
 #endif
+ direct_data_complete=false;
+ if(direct_phase && !reuse_phase){
+  if(!phase_prepared)epd_lcd_prepare_frame(source,source_ctx);
+  active_phase=1-active_phase;phase_prepared=false;}
  assert(pthread_create(&scanner,0,scan_run,source_ctx)==0);scan_joinable=true;
 }
-void epd_lcd_abort_frame(void){atomic_store(&abort_scan,true);if(scan_joinable){pthread_join(scanner,0);scan_joinable=false;}}
+void epd_lcd_abort_frame(void){atomic_store(&abort_scan,true);if(scan_joinable){pthread_join(scanner,0);scan_joinable=false;}phase_prepared=false;}
 static void* feed_run(void* p){
  struct HostTask* t=p;core=t->id;
  while(xSemaphoreTake(t->notify,portMAX_DELAY)){
@@ -184,6 +201,8 @@ int main(void){
  for(int i=0;i<2;++i){ctx.line_queues[i]=lq_init(EPD_LCD_FULL_PHASE ? epd_lcd_phase_queue_capacity(ctx.lines_total):128,16);ctx.feed_done_smphr[i]=xSemaphoreCreateBinary();ctx.feed_space[i]=xSemaphoreCreateBinary();tasks[i]=(struct HostTask){.notify=xSemaphoreCreateBinary(),.ctx=&ctx,.id=i};ctx.feed_tasks[i]=&tasks[i];pthread_create(&tasks[i].thread,0,feed_run,&tasks[i]);}
  // Repeat after both failure types: no old phase, callback, queue, or semaphore can leak.
  int scenarios[]={0,1,0,2,0,0,3,0};
+ for(unsigned direct=0;direct<=(EPD_LCD_FULL_PHASE?1:0);++direct) { direct_phase=direct;
+ if(direct)for(unsigned i=0;i<2;++i){lq_free(&ctx.line_queues[i]);ctx.line_queues[i]=lq_init(epd_lcd_phase_queue_capacity(ctx.lines_total),16);}
  for(unsigned t=0;t<sizeof(scenarios)/sizeof(*scenarios);++t){
   test_fault=scenarios[t];irq_core=t%2;ctx.error=0;ctx.current_frame=0;epd_metrics_reset();
   delay_feeder=EPD_LCD_FULL_PHASE && t==5;
@@ -194,6 +213,8 @@ int main(void){
   if(!test_fault){assert(m.completed==5);assert(m.pixel_clock_hz==20000000);assert(!m.fault_phase && !m.fault_line && !m.fault_thread);assert(atomic_load(&preparations)==(EPD_LCD_FULL_PHASE?6:10));}
   for(int i=0;i<2;++i){assert(atomic_load(&ctx.line_queues[i].current)==atomic_load(&ctx.line_queues[i].last));assert(!atomic_load(&ctx.feed_waiting[i]));}
  }
+ }
+ if(EPD_LCD_FULL_PHASE)assert(packing_overlap>0);
  // The clear ISR must reuse its reserved row across colors, cropped regions,
  // interrupted scans and missing completion. A per-clear malloc/free fails
  // this ownership check and makes SRAM placement depend on unrelated heaps.
@@ -209,7 +230,7 @@ int main(void){
   assert(clear_words[0]==0xCDCDCDCD && clear_words[5]==0xCDCDCDCD);
   assert((ctx.error!=0)==(test_fault!=0));
   EpdMetrics m=epd_metrics_get();assert(m.faults==(test_fault!=0));
-  if(test_fault){assert(m.fault_phase==1 && m.fault_line==16 && m.completed==0);}
+  if(test_fault){assert(m.fault_phase==1 && m.fault_line==(direct_phase?684:16) && m.completed==0);}
  }
  assert(atomic_load(&overlap)>0);atomic_store(&quit,true);
  for(int i=0;i<2;++i){xTaskNotifyGive(&tasks[i]);pthread_join(tasks[i].thread,0);lq_free(&ctx.line_queues[i]);vSemaphoreDelete(tasks[i].notify);vSemaphoreDelete(ctx.feed_done_smphr[i]);vSemaphoreDelete(ctx.feed_space[i]);}

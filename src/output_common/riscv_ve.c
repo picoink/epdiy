@@ -77,7 +77,15 @@ __attribute__((optimize("O3"))) uint32_t epd_interlace_gl4_line(
 ) {
     uint32_t dirty=0;
     for(int p=0;p<width/2;p+=2) {
-        uint16_t t,f,c;memcpy(&t,to+p,2);memcpy(&f,from+p,2);memcpy(&c,columns+p,2);
+        uint16_t t,f,c;memcpy(&t,to+p,2);memcpy(&f,from+p,2);
+        if((t&f)==UINT16_MAX) {
+            // Unchanged white dominates text margins and inter-glyph space.
+            // Keep the same packed transitions without loading dirty columns.
+            const uint32_t white=0x0fff0fffu;
+            memcpy(diff+p*2,&white,4);
+            continue;
+        }
+        memcpy(&c,columns+p,2);
         c|=t^f;memcpy(columns+p,&c,2);dirty|=t^f;
         const uint32_t v=(f&15)|((t<<2)&0x30)|((f&0xf0)<<2)|((t&0xc0)<<4)|
             ((uint32_t)(f&0xf00)<<8)|((uint32_t)(t&0xc00)<<10)|

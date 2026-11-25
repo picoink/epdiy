@@ -128,6 +128,19 @@ static inline int max(int x, int y) {
 #define EPD_LCD_PROBE_D0_TOGGLE 0
 #endif
 #define BOUNCE_BUF_LINES EPD_LCD_PROBE_BOUNCE
+#if defined(CONFIG_IDF_TARGET_ESP32S31) && EPD_LCD_FULL_PHASE
+#define EPD_DIRECT_PHASE_DMA 1
+#else
+#define EPD_DIRECT_PHASE_DMA 0
+#endif
+
+#if EPD_DIRECT_PHASE_DMA
+// Two immutable wire images exchange scan/preparation ownership at completion.
+__attribute__((weak)) void* epd_allocate_dma_phase(size_t bytes) {
+    return heap_caps_aligned_calloc(64, 1, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+__attribute__((weak)) void epd_release_dma_phase(void* p) { heap_caps_free(p); }
+#endif
 
 #define RMT_CKV_CHAN RMT_CHANNEL_1
 
@@ -161,6 +174,12 @@ typedef struct {
     LcdEpdConfig_t config;
 
     uint8_t* bounce_buffer[2];
+#if EPD_DIRECT_PHASE_DMA
+    uint8_t* phase_buffer[2];
+    size_t phase_bytes, phase_capacity;
+    bool phase_complete, phase_prepared;
+    unsigned active_phase;
+#endif
     // size of a single bounce buffer
     size_t bb_size;
     size_t batches;
@@ -214,6 +233,14 @@ typedef struct {
 } s3_lcd_t;
 
 static s3_lcd_t lcd = { 0 };
+bool epd_lcd_has_phase_buffer(void) { return EPD_DIRECT_PHASE_DMA; }
+bool IRAM_ATTR epd_lcd_frame_data_complete(void) {
+#if EPD_DIRECT_PHASE_DMA
+    return lcd.phase_complete;
+#else
+    return true;
+#endif
+}
 
 static bool use_native_scan_timing(const LcdEpdConfig_t* config) {
     #if defined(CONFIG_IDF_TARGET_ESP32S31)
@@ -257,6 +284,12 @@ static IRAM_ATTR void lcd_finish_frame_from_isr(bool notify_frame_done) {
         return;
     }
     lcd.frame_finishing = true;
+#if EPD_DIRECT_PHASE_DMA
+    // EOF is latched with interrupts disabled. It proves DMA consumed the
+    // prepared payload; preparing every row alone is not scan completion.
+    lcd.phase_complete = (axi_dma_ll_tx_get_interrupt_status(lcd.dma_dev,
+        lcd.dma_channel, true) & GDMA_LL_EVENT_TX_EOF) != 0;
+#endif
     lcd_ll_enable_interrupt(lcd.hal.dev, LCD_LL_EVENT_VSYNC_END | LCD_LL_EVENT_TRANS_DONE, false);
     if (lcd.frame_t0_us > 0) {
         lcd.last_frame_us = esp_timer_get_time() - lcd.frame_t0_us;
@@ -280,6 +313,9 @@ static void abort_frame_on_irq_core(void* arg) {
 #endif
 
 void epd_lcd_abort_frame(void) {
+#if EPD_DIRECT_PHASE_DMA
+    lcd.phase_prepared=false;
+#endif
     #if defined(CONFIG_IDF_TARGET_ESP32S31)
     enable_dma_eof(false);
     lcd_ll_enable_interrupt(lcd.hal.dev, LCD_LL_EVENT_VSYNC_END | LCD_LL_EVENT_TRANS_DONE, false);
@@ -303,7 +339,7 @@ int64_t epd_lcd_get_spv_start_us(void) {
     return lcd.spv_start_us;
 }
 
-static IRAM_ATTR bool fill_bounce_buffer(uint8_t* buffer) {
+static IRAM_ATTR bool fill_bounce_buffer(uint8_t* buffer, bool synchronize) {
     bool task_awoken = false;
 
     for (int i = 0; i < BOUNCE_BUF_LINES; i++) {
@@ -331,7 +367,7 @@ static IRAM_ATTR bool fill_bounce_buffer(uint8_t* buffer) {
     }
 
 #if defined(CONFIG_IDF_TARGET_ESP32S31) || defined(CONFIG_IDF_TARGET_ESP32P4)
-    if (lcd.bb_behind_cache) {
+    if (synchronize && lcd.bb_behind_cache) {
         esp_cache_msync(buffer, lcd.bb_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
     }
 #endif
@@ -545,7 +581,7 @@ static IRAM_ATTR bool lcd_rgb_panel_eof_handler(
     int bb = (int)(lcd.bb_eof_count & 1u);
     lcd.bb_eof_count += 1;
     // 尾部继续补无驱动数据，让 LCD 排空缓冲并完成末行扫描。
-    const bool awoken = fill_bounce_buffer(lcd.bounce_buffer[bb]);
+    const bool awoken = fill_bounce_buffer(lcd.bounce_buffer[bb], true);
     // AXI-GDMA：补数后交还 DMA，否则 check_owner 时描述符停在 CPU
     lcd.dma_nodes[bb].dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
     const int64_t work = esp_timer_get_time() - t0;
@@ -577,6 +613,26 @@ static void register_dma_callback_on_irq_core(void* arg) {
 #endif
 
 static esp_err_t init_dma_trans_link() {
+#if EPD_DIRECT_PHASE_DMA
+    size_t offset = 0;
+    for (size_t i = 0; i + 1 < lcd.num_dma_nodes; ++i) {
+        const size_t count = min(4032, lcd.phase_bytes - offset);
+        lcd.dma_nodes[i].dw0.size = count;
+        lcd.dma_nodes[i].dw0.length = count;
+        lcd.dma_nodes[i].dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
+        lcd.dma_nodes[i].dw0.suc_eof = offset + count == lcd.phase_bytes;
+        lcd.dma_nodes[i].buffer = lcd.phase_buffer[lcd.active_phase] + offset;
+        lcd.dma_nodes[i].next = &lcd.dma_nodes[i + 1];
+        offset += count;
+    }
+    assert(offset == lcd.phase_bytes);
+    // A zero-drive tail keeps FIFO prefetch harmless until physical VSYNC.
+    lcd_dma_desc_t* tail = &lcd.dma_nodes[lcd.num_dma_nodes - 1];
+    tail->dw0.size = tail->dw0.length = 64;
+    tail->dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
+    tail->buffer = lcd.phase_buffer[lcd.active_phase] + lcd.phase_capacity - 64;
+    tail->next = tail;
+#else
     lcd.dma_nodes[0].dw0.suc_eof = 1;
     lcd.dma_nodes[0].dw0.size = lcd.bb_size;
     lcd.dma_nodes[0].dw0.length = lcd.bb_size;
@@ -592,6 +648,8 @@ static esp_err_t init_dma_trans_link() {
     // loop end back to start
     lcd.dma_nodes[0].next = &lcd.dma_nodes[1];
     lcd.dma_nodes[1].next = &lcd.dma_nodes[0];
+
+#endif
 
     // alloc DMA channel and connect to LCD peripheral
     gdma_channel_alloc_config_t dma_chan_config = {
@@ -622,7 +680,7 @@ static esp_err_t init_dma_trans_link() {
     /* bounce 在内部 SRAM，勿开 ext_mem，避免 AXI 误触 PSRAM 对齐检查 */
     gdma_transfer_config_t trans_cfg = {
         .max_data_burst_size = 64,
-        .access_ext_mem = false,
+        .access_ext_mem = EPD_DIRECT_PHASE_DMA,
     };
     ESP_RETURN_ON_ERROR(gdma_config_transfer(lcd.dma_chan, &trans_cfg), TAG, "dma setup error");
 #else
@@ -832,6 +890,25 @@ static esp_err_t allocate_lcd_buffers() {
 #if defined(CONFIG_IDF_TARGET_ESP32S31) || defined(CONFIG_IDF_TARGET_ESP32P4)
     lcd.bb_behind_cache = true; // 内部 SRAM 也可能经 cache，与 esp_lcd RGB 一致
 #endif
+#if EPD_DIRECT_PHASE_DMA
+    const size_t stride = lcd.line_bytes + lcd.dummy_bytes;
+    lcd.phase_bytes = ((size_t)lcd.display_lines * stride + 63) & ~(size_t)63;
+    lcd.phase_capacity = (((lcd.display_lines + BOUNCE_BUF_LINES - 1) / BOUNCE_BUF_LINES)
+        * BOUNCE_BUF_LINES * stride + 63) & ~(size_t)63;
+    lcd.phase_capacity += 64;
+    lcd.active_phase=0; lcd.phase_prepared=false;
+    for(unsigned i=0;i<2;++i) {
+        lcd.phase_buffer[i] = epd_allocate_dma_phase(lcd.phase_capacity);
+        ESP_RETURN_ON_FALSE(lcd.phase_buffer[i], ESP_ERR_NO_MEM, TAG, "no immutable DMA phase");
+        memset(lcd.phase_buffer[i], 0, lcd.phase_capacity);
+    }
+    lcd.num_dma_nodes = (lcd.phase_bytes + 4031) / 4032 + 1;
+    lcd.dma_nodes = heap_caps_aligned_calloc(LCD_GDMA_DESC_ALIGN, lcd.num_dma_nodes,
+        sizeof(lcd_dma_desc_t), dma_flags);
+    ESP_RETURN_ON_FALSE(lcd.dma_nodes, ESP_ERR_NO_MEM, TAG, "no phase DMA descriptors");
+    ESP_LOGI(TAG, "immutable phase DMA: %u PSRAM bytes, %u descriptors; no refill IRQ",
+        (unsigned)(2*lcd.phase_capacity), (unsigned)lcd.num_dma_nodes);
+#else
     for (int i = 0; i < 2; i++) {
         lcd.bounce_buffer[i] =
             heap_caps_aligned_calloc(bb_align, 1, lcd.bb_size, dma_flags);
@@ -854,10 +931,17 @@ static esp_err_t allocate_lcd_buffers() {
              "LCD bounce×2=%u B (%u×2) + dma_desc=%u B (align=%u) INTERNAL|DMA",
              (unsigned)(lcd.bb_size * 2), (unsigned)lcd.bb_size,
              (unsigned)(2 * sizeof(lcd_dma_desc_t)), (unsigned)bb_align);
+#endif
     return ESP_OK;
 }
 
 static void free_lcd_buffers() {
+#if EPD_DIRECT_PHASE_DMA
+    for(unsigned i=0;i<2;++i) {
+        if(lcd.phase_buffer[i])epd_release_dma_phase(lcd.phase_buffer[i]);
+        lcd.phase_buffer[i] = NULL;
+    }
+#endif
     for (int i = 0; i < 2; i++) {
         uint8_t* buf = lcd.bounce_buffer[i];
         if (buf != NULL) {
@@ -1219,7 +1303,23 @@ static void log_lcd_suspects(void) {
 }
 #endif
 
-void IRAM_ATTR epd_lcd_start_frame() {
+void epd_lcd_prepare_frame(line_cb_func_t source, void* payload) {
+#if EPD_DIRECT_PHASE_DMA
+    uint8_t* phase=lcd.phase_buffer[1-lcd.active_phase];
+    for(int row=0;row<lcd.display_lines;++row) {
+        uint8_t* target=phase+(size_t)row*(lcd.line_bytes+lcd.dummy_bytes)+(lcd.dummy_bytes%2);
+        if(source)source(payload,target);else memset(target,0,lcd.line_bytes);
+        epd_filter_white_border(target,row,lcd.line_bytes,lcd.native_height,
+            lcd.config.white_border_pixels,border_whitening);
+    }
+    ESP_ERROR_CHECK(esp_cache_msync(phase,lcd.phase_capacity,ESP_CACHE_MSYNC_FLAG_DIR_C2M));
+    lcd.phase_prepared=true;
+#else
+    (void)source; (void)payload;
+#endif
+}
+
+void IRAM_ATTR epd_lcd_start_frame(bool reuse_phase) {
     int initial_lines = min(LINE_BATCH, lcd.display_lines);
 
     // 用上一相 EOF 间隔反推行周期（bounce 行一组）
@@ -1291,14 +1391,36 @@ void IRAM_ATTR epd_lcd_start_frame() {
     lcd.eof_work_sum_us = 0;
     lcd.eof_work_n = 0;
     lcd.frame_t0_us = 0;
-    fill_bounce_buffer(lcd.bounce_buffer[0]);
-    fill_bounce_buffer(lcd.bounce_buffer[1]);
+#if EPD_DIRECT_PHASE_DMA
+    lcd.phase_complete = false;
+    if (!reuse_phase) {
+        if(!lcd.phase_prepared)epd_lcd_prepare_frame(lcd.line_source_cb,lcd.line_cb_payload);
+        lcd.active_phase=1-lcd.active_phase;
+        lcd.phase_prepared=false;
+        size_t offset=0;
+        for(size_t i=0;i+1<lcd.num_dma_nodes;++i) {
+            lcd.dma_nodes[i].buffer=lcd.phase_buffer[lcd.active_phase]+offset;
+            offset+=lcd.dma_nodes[i].dw0.length;
+        }
+        lcd.dma_nodes[lcd.num_dma_nodes-1].buffer=lcd.phase_buffer[lcd.active_phase]+lcd.phase_capacity-64;
+    }
+    for (size_t i = 0; i < lcd.num_dma_nodes; ++i)
+        lcd.dma_nodes[i].dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
+    // INTERNAL|DMA descriptors use the coherent DMA-capable SRAM mapping.
+    // esp_cache_msync rejects this non-cacheable region on S31; only the
+    // PSRAM payload above needs explicit cache publication.
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#else
+    (void)reuse_phase;
+    fill_bounce_buffer(lcd.bounce_buffer[0], true);
+    fill_bounce_buffer(lcd.bounce_buffer[1], true);
     lcd.dma_nodes[0].dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
     lcd.dma_nodes[1].dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
+#endif
 
     // the start of DMA should be prior to the start of LCD engine
     #if defined(CONFIG_IDF_TARGET_ESP32S31)
-    enable_dma_eof(true);
+    enable_dma_eof(!EPD_DIRECT_PHASE_DMA);
     #endif
     gdma_start(lcd.dma_chan, (intptr_t)&lcd.dma_nodes[0]);
 

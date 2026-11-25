@@ -4,11 +4,15 @@
 #ifndef EPD_LCD_FULL_PHASE
 #define EPD_LCD_FULL_PHASE 0
 #endif
+bool epd_lcd_has_phase_buffer(void);
 
 // Two immutable phases plus one spare ring slot, including S31 IRQ-core skew.
 // Full-phase publication removes the scan's dependence on feeder scheduling.
 static inline int epd_lcd_phase_queue_capacity(int lines) {
     int capacity = (lines + NUM_RENDER_THREADS - 1) / NUM_RENDER_THREADS + 1;
+    // Direct DMA consumes each complete queue before scanning. Its two wire
+    // images replace the second queued phase rather than expanding the budget.
+    if(EPD_LCD_FULL_PHASE && epd_lcd_has_phase_buffer())return capacity;
 #if defined(CONFIG_IDF_TARGET_ESP32S31)
     capacity += (lines + 15) / 16;
 #endif
