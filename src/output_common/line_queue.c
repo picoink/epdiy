@@ -30,8 +30,7 @@ LineQueue_t lq_init(int queue_len, int element_size) {
 
     int elem_buf_size = ceil_div(element_size, 16) * 16;
 
-    queue.bufs = calloc(queue.size, sizeof(uint8_t*));
-    assert(queue.bufs != NULL);
+    queue.bufs = NULL;
 
     size_t line_q_bytes = 0;
 #if EPD_LINE_QUEUE_PSRAM
@@ -40,20 +39,28 @@ LineQueue_t lq_init(int queue_len, int element_size) {
     // cache-disable operation until the complete display scan has finished.
     queue.storage=epd_allocate_line_queue((size_t)elem_buf_size*queue.size);
     assert(queue.storage != NULL);
+#else
+    queue.bufs = calloc(queue.size, sizeof(uint8_t*));
+    assert(queue.bufs != NULL);
 #endif
     for (int i = 0; i < queue.size; i++) {
-#if EPD_LINE_QUEUE_PSRAM
-        queue.bufs[i]=queue.storage+(size_t)i*elem_buf_size;
-#else
+#if !EPD_LINE_QUEUE_PSRAM
         queue.bufs[i] = heap_caps_aligned_alloc(16, elem_buf_size, MALLOC_CAP_INTERNAL);
-#endif
         assert(queue.bufs[i] != NULL);
+#endif
         line_q_bytes += (size_t)elem_buf_size;
     }
     ESP_LOGD("epd_dram", "line_q elems=%d×%d=%u B", queue.size, elem_buf_size,
              (unsigned)line_q_bytes);
 
     return queue;
+}
+
+static inline uint8_t* IRAM_ATTR line_at(LineQueue_t* queue, int index) {
+    // Contiguous queues need no per-row pointer table in DMA-capable SRAM.
+    // The arithmetic also avoids an extra memory load in the scan ISR.
+    return queue->storage ? queue->storage + ((queue->element_size + 15) & ~(size_t)15) * index
+                          : queue->bufs[index];
 }
 
 /// Deinitialize the line queue and free memory.
@@ -73,7 +80,7 @@ uint8_t* IRAM_ATTR lq_current(LineQueue_t* queue) {
     if ((current + 1) % queue->size == last) {
         return NULL;
     }
-    return queue->bufs[current];
+    return line_at(queue,current);
 }
 
 void IRAM_ATTR lq_commit(LineQueue_t* queue) {
@@ -90,7 +97,7 @@ int IRAM_ATTR lq_read(LineQueue_t* queue, uint8_t* dst) {
         return -1;
     }
 
-    memcpy(dst, queue->bufs[last], queue->element_size);
+    memcpy(dst, line_at(queue,last), queue->element_size);
 
     int next = (last + 1) % queue->size;
     atomic_store_explicit(&queue->last, next, memory_order_release);
