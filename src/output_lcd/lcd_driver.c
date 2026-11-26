@@ -1,4 +1,5 @@
 #include "lcd_driver.h"
+#include "lcd_line_layout.h"
 #include "epdiy.h"
 
 #ifndef __DECLARE_RCC_ATOMIC_ENV
@@ -221,10 +222,8 @@ typedef struct {
     /// The number of bytes in a horizontal display register line.
     int line_bytes;
 
-    // With 8 bit bus width, we need a dummy cycle before the actual data,
-    // because the LCD peripheral behaves weirdly.
-    // Also see:
-    // https://blog.adafruit.com/2022/06/14/esp32uesday-hacking-the-esp32-s3-lcd-peripheral/
+    // Legacy LCD dummy-phase padding. S31 native RGB has no dummy phase
+    // and must not prepend bytes to the active panel data.
     int dummy_bytes;
 
     /// The number of lines of the display
@@ -343,8 +342,7 @@ static IRAM_ATTR bool fill_bounce_buffer(uint8_t* buffer, bool synchronize) {
     bool task_awoken = false;
 
     for (int i = 0; i < BOUNCE_BUF_LINES; i++) {
-        // 8bit 时 dummy 占前 1 字节；仍走 line_source 以免队列饿死。
-        int buffer_offset = i * (lcd.line_bytes + lcd.dummy_bytes) + (lcd.dummy_bytes % 2);
+        const size_t buffer_offset = epd_lcd_row_offset(i,lcd.line_bytes,lcd.dummy_bytes);
         if (lcd.lines_fed >= (size_t)lcd.display_lines) {
             memset(&buffer[buffer_offset], 0x00, lcd.line_bytes);
             continue;
@@ -856,11 +854,9 @@ static void assign_lcd_parameters_from_config(
     lcd.line_bytes = display_width / 4;
     lcd.lcd_res_h = lcd.line_bytes / (lcd.config.bus_width / 8);
 
-    // With 8 bit bus width, we need a dummy cycle before the actual data,
-    // because the LCD peripheral behaves weirdly.
-    // Also see:
-    // https://blog.adafruit.com/2022/06/14/esp32uesday-hacking-the-esp32-s3-lcd-peripheral/
-    lcd.dummy_bytes = lcd.config.bus_width / 8;
+    // Match both DMA layout and active width to the enabled peripheral phase.
+    // A legacy leading dummy byte on S31 displaces four physical panel pixels.
+    lcd.dummy_bytes = epd_lcd_dummy_bytes(lcd.config.bus_width);
 
     // each bounce buffer holds a number of lines with data + dummy bytes each
     lcd.bb_size = BOUNCE_BUF_LINES * (lcd.line_bytes + lcd.dummy_bytes);
@@ -1033,12 +1029,7 @@ static esp_err_t init_lcd_peripheral() {
 #else
     lcd_ll_set_data_width(lcd.hal.dev, lcd.config.bus_width);
 #endif
-#if defined(CONFIG_IDF_TARGET_ESP32S31)
-    // 示波器已确认 1 拍/字节。跟 esp_lcd：phase(0,0,1)+always_on，行长由 H 时序切。
-    lcd_ll_set_phase_cycles(lcd.hal.dev, 0, 0, 1);
-#else
     lcd_ll_set_phase_cycles(lcd.hal.dev, 0, (lcd.dummy_bytes > 0), 1);
-#endif
     lcd_ll_enable_output_hsync_in_porch_region(lcd.hal.dev, false);
 
 #if defined(CONFIG_IDF_TARGET_ESP32S31)
@@ -1307,7 +1298,7 @@ void epd_lcd_prepare_frame(line_cb_func_t source, void* payload) {
 #if EPD_DIRECT_PHASE_DMA
     uint8_t* phase=lcd.phase_buffer[1-lcd.active_phase];
     for(int row=0;row<lcd.display_lines;++row) {
-        uint8_t* target=phase+(size_t)row*(lcd.line_bytes+lcd.dummy_bytes)+(lcd.dummy_bytes%2);
+        uint8_t* target=phase+epd_lcd_row_offset(row,lcd.line_bytes,lcd.dummy_bytes);
         if(source)source(payload,target);else memset(target,0,lcd.line_bytes);
         epd_filter_white_border(target,row,lcd.line_bytes,lcd.native_height,
             lcd.config.white_border_pixels,border_whitening);

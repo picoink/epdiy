@@ -5,6 +5,12 @@ import os, subprocess, tempfile
 here=Path(__file__).resolve().parent
 src=here.parents[1]/'src'
 with tempfile.TemporaryDirectory(prefix='epd-pipeline-') as tmp:
+    for target in ([], ['-DCONFIG_IDF_TARGET_ESP32S31=1']):
+        exe=Path(tmp)/'line-layout'
+        subprocess.run([os.environ.get('CC','cc'),'-std=c11','-O2','-fsanitize=undefined',
+            '-fno-sanitize-recover=all','-Wall','-Wextra',*target,'-I'+str(src),
+            str(here/'line_layout.c'),'-o',str(exe)],check=True)
+        subprocess.run([str(exe)],check=True,timeout=10)
     for full, psram in ((0,0),(0,1),(1,0),(1,1)):
         exe=Path(tmp)/'pipeline'
         subprocess.run([os.environ.get('CC','cc'),'-std=gnu11','-O2','-pthread','-g','-fsanitize=undefined','-fno-sanitize-recover=all',
