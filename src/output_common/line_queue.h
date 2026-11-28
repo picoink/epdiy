@@ -12,9 +12,14 @@ typedef struct {
     atomic_int current;
     atomic_int last;
     uint8_t** bufs;
+    uint8_t* storage;
     // size of an element
     size_t element_size;
 } LineQueue_t;
+
+// Product-managed, aligned PSRAM storage for renderer workspaces and queues.
+void* epd_allocate_line_queue(size_t bytes);
+void epd_release_line_queue(void* pointer);
 
 /// Initialize the line queue and allocate memory.
 LineQueue_t lq_init(int queue_len, int element_size);

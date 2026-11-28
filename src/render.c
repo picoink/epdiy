@@ -31,6 +31,12 @@
 #include "output_lcd/render_lcd.h"
 #include "output_lcd/lcd_driver.h"
 
+#if defined(CONFIG_IDF_TARGET_ESP32S31) && EPD_LCD_FULL_PHASE
+#define EPD_EXTERNAL_RENDER_WORKSPACE 1
+#else
+#define EPD_EXTERNAL_RENDER_WORKSPACE 0
+#endif
+
 static inline int min(int x, int y) {
     return x < y ? x : y;
 }
@@ -293,7 +299,9 @@ static void IRAM_ATTR render_thread(void* arg) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
 #ifdef RENDER_METHOD_LCD
+        const int64_t feed_started = esp_timer_get_time();
         lcd_calculate_frame(&render_context, thread_id);
+        render_context.feed_time_us[thread_id] += esp_timer_get_time() - feed_started;
 #elif defined(RENDER_METHOD_I2S)
         if (thread_id == 0) {
             i2s_fetch_frame_data(&render_context, thread_id);
@@ -348,18 +356,25 @@ void epd_renderer_init(enum EpdInitOptions options) {
     render_context.display_height = epd_height();
 
 #ifdef RENDER_METHOD_LCD
+#if EPD_EXTERNAL_RENDER_WORKSPACE
+    // Full-phase DMA invokes clear-row callbacks only during task-side packing.
+    render_context.static_line_buffer = epd_allocate_line_queue(render_context.display_width / 4);
+#else
     // Reserve the clear row before application allocations fragment HP SRAM.
     // S31's default/internal heap also includes slow LP RAM: reading a row from
     // there in the DMA ISR can exceed the entire bounce-buffer refill interval.
     render_context.static_line_buffer = heap_caps_malloc(
         render_context.display_width / 4, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT
     );
+#endif
     assert(render_context.static_line_buffer != NULL);
 #endif
 
     size_t lut_size = 0;
     if (options & EPD_LUT_1K) {
         lut_size = 1 << 10;
+    } else if (options & EPD_LUT_4K) {
+        lut_size = 1 << 12;
     } else if (options & EPD_LUT_64K) {
         lut_size = 1 << 16;
     } else if (options == EPD_OPTIONS_DEFAULT) {
@@ -374,8 +389,19 @@ void epd_renderer_init(enum EpdInitOptions options) {
     }
 
     ESP_LOGI("epd", "Space used for waveform LUT: %dK", lut_size / 1024);
-    render_context.conversion_lut
-        = (uint8_t*)heap_caps_malloc(lut_size, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    uint32_t lut_caps = MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL;
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+    // INTERNAL also admits LP SRAM on S31. This lookup table is read for every
+    // driven pixel, so keep its small working set in the fast HP/DMA heap.
+    lut_caps |= MALLOC_CAP_DMA;
+#endif
+#if EPD_EXTERNAL_RENDER_WORKSPACE
+    // Producers read this CPU-only table before DMA consumes immutable bytes.
+    // Preserve scarce HP SRAM for the radio and its DMA-capable allocations.
+    render_context.conversion_lut = epd_allocate_line_queue(lut_size);
+#else
+    render_context.conversion_lut = (uint8_t*)heap_caps_malloc(lut_size, lut_caps);
+#endif
     if (render_context.conversion_lut == NULL) {
         ESP_LOGE("epd", "could not allocate LUT!");
         abort();
@@ -412,15 +438,21 @@ void epd_renderer_init(enum EpdInitOptions options) {
     }
     // 127 usable slots per feeder hold 125 prefilled rows plus scan jitter.
     queue_len = max(queue_len, 128);
-    ESP_LOGD("epd", "line queue len=%d threads=%d (stream prefill)", queue_len, NUM_RENDER_THREADS);
+#if defined(RENDER_METHOD_LCD) && EPD_LCD_FULL_PHASE
+    queue_len = max(queue_len, epd_lcd_phase_queue_capacity(scan_display_height()));
+#endif
+    ESP_LOGD("epd", "line queue len=%d threads=%d", queue_len, NUM_RENDER_THREADS);
 
     if (render_context.conversion_lut == NULL) {
         ESP_LOGE("epd", "could not allocate line mask!");
         abort();
     }
 
-    render_context.line_mask
-        = heap_caps_aligned_alloc(16, epd_width() / 4, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+#if EPD_EXTERNAL_RENDER_WORKSPACE
+    render_context.line_mask = epd_allocate_line_queue(epd_width() / 4);
+#else
+    render_context.line_mask = heap_caps_aligned_alloc(16, epd_width() / 4, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+#endif
     assert(render_context.line_mask != NULL);
 
 #ifdef RENDER_METHOD_LCD
@@ -456,8 +488,8 @@ void epd_renderer_init(enum EpdInitOptions options) {
     const size_t line_threads_bytes = (size_t)scan_display_height();
     const size_t line_mask_bytes = (size_t)epd_width() / 4;
     ESP_LOGD("epd_dram",
-             "render: lut=%u INTERNAL; line_q≈%u B; mask/thr INTERNAL=%u B",
-             (unsigned)lut_size, (unsigned)line_q_bytes,
+             "render: lut=%u external=%d; line_q≈%u B; mask/thr=%u B",
+             (unsigned)lut_size, EPD_EXTERNAL_RENDER_WORKSPACE, (unsigned)line_q_bytes,
              (unsigned)(line_threads_bytes + line_mask_bytes));
 }
 
@@ -486,14 +518,21 @@ void epd_renderer_deinit() {
         epd_board->deinit();
     }
 
+#if EPD_EXTERNAL_RENDER_WORKSPACE
+    epd_release_line_queue(render_context.conversion_lut);
+    epd_release_line_queue(render_context.line_mask);
+    epd_release_line_queue(render_context.static_line_buffer);
+    render_context.static_line_buffer = NULL;
+#else
     heap_caps_free(render_context.conversion_lut);
-    heap_caps_free(render_context.line_threads);
-    heap_caps_free(render_context.line_ready);
     heap_caps_free(render_context.line_mask);
 #ifdef RENDER_METHOD_LCD
     heap_caps_free(render_context.static_line_buffer);
     render_context.static_line_buffer = NULL;
 #endif
+#endif
+    heap_caps_free(render_context.line_threads);
+    heap_caps_free(render_context.line_ready);
     vSemaphoreDelete(render_context.frame_done);
     vSemaphoreDelete(render_context.prefill_done);
 }
@@ -574,7 +613,10 @@ __attribute__((optimize("O3"))) bool _epd_interlace_line(
 #endif
 }
 
-EpdRect epd_difference_image_base(
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+uint32_t epd_interlace_gl4_line(const uint8_t*,const uint8_t*,uint8_t*,uint8_t*,int);
+#endif
+static EpdRect difference_image(
     const uint8_t* to,
     const uint8_t* from,
     EpdRect crop_to,
@@ -582,7 +624,7 @@ EpdRect epd_difference_image_base(
     int fb_height,
     uint8_t* interlaced,
     bool* dirty_lines,
-    uint8_t* col_dirtyness
+    uint8_t* col_dirtyness, bool compact
 ) {
     assert(fb_width % 8 == 0);
     assert(col_dirtyness != NULL);
@@ -601,7 +643,11 @@ EpdRect epd_difference_image_base(
 
     for (int y = crop_to.y; y < y_end; y++) {
         uint32_t offset = y * fb_width / 2;
-        int dirty = _epd_interlace_line(
+        int dirty;
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+        if(compact)dirty=epd_interlace_gl4_line(to+offset,from+offset,interlaced+offset*2,col_dirtyness,fb_width);else
+#endif
+        dirty = _epd_interlace_line(
             to + offset, from + offset, interlaced + offset * 2, col_dirtyness, fb_width
         );
         dirty_lines[y] = dirty;
@@ -635,6 +681,15 @@ EpdRect epd_difference_image_base(
     };
 
     return crop_rect;
+}
+
+EpdRect epd_difference_image_base(const uint8_t* to,const uint8_t* from,EpdRect crop,
+    int width,int height,uint8_t* diff,bool* rows,uint8_t* columns) {
+    return difference_image(to,from,crop,width,height,diff,rows,columns,false);
+}
+EpdRect epd_difference_image_compact(const uint8_t* to,const uint8_t* from,EpdRect crop,
+    uint8_t* diff,bool* rows,uint8_t* columns) {
+    return difference_image(to,from,crop,epd_width(),epd_height(),diff,rows,columns,true);
 }
 
 EpdRect epd_difference_image(

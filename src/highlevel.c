@@ -11,6 +11,7 @@
 
 #include "epd_highlevel.h"
 #include "epdiy.h"
+#include "output_common/lut.h"
 
 #ifndef _swap_int
 #define _swap_int(a, b) \
@@ -92,7 +93,7 @@ enum EpdDrawError epd_hl_update_screen_full(
     EpdRect area = epd_full_screen();
     uint32_t ts = esp_timer_get_time() / 1000;
 
-    epd_difference_image_cropped(
+    (mode & MODE_GL4_COMPACT ? epd_difference_image_compact : epd_difference_image_cropped)(
         state->front_fb,
         state->back_fb,
         area,
@@ -216,7 +217,7 @@ enum EpdDrawError epd_hl_update_area(EpdiyHighlevelState* state, enum EpdDrawMod
     uint32_t ts = esp_timer_get_time() / 1000;
 
     // FIXME: use crop information here, if available
-    EpdRect diff_area = epd_difference_image_cropped(
+    EpdRect diff_area = (mode & MODE_GL4_COMPACT ? epd_difference_image_compact : epd_difference_image_cropped)(
         state->front_fb,
         state->back_fb,
         area,

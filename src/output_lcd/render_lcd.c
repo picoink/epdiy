@@ -44,11 +44,11 @@ static void IRAM_ATTR record_underflow(RenderContext_t* ctx,int reason,int threa
 }
 
 __attribute__((optimize("O3"))) static bool IRAM_ATTR
-retrieve_line_isr(RenderContext_t* ctx, uint8_t* buf) {
-    if (ctx->lines_consumed >= ctx->lines_total) {
+retrieve_line(RenderContext_t* ctx, uint8_t* buf,volatile int* consumed) {
+    if (*consumed >= ctx->lines_total) {
         return false;
     }
-    int thread = ctx->line_threads[ctx->lines_consumed];
+    int thread = ctx->line_threads[*consumed];
     BaseType_t awoken = pdFALSE;
 
     // Queue commit is the authoritative release/acquire publication. A producer
@@ -57,7 +57,7 @@ retrieve_line_isr(RenderContext_t* ctx, uint8_t* buf) {
     if (thread < 0 || thread >= NUM_RENDER_THREADS) {
         record_underflow(ctx,1,thread);
         memset(buf, 0x00, ctx->display_width / 4);
-        ctx->lines_consumed += 1;
+        *consumed += 1;
         return awoken;
     }
 
@@ -73,11 +73,20 @@ retrieve_line_isr(RenderContext_t* ctx, uint8_t* buf) {
         xSemaphoreGiveFromISR(ctx->feed_space[thread], &awoken);
     }
 
-    if (ctx->lines_consumed >= ctx->display_height) {
+    if (*consumed >= ctx->display_height) {
         memset(buf, 0x00, ctx->display_width / 4);
     }
-    ctx->lines_consumed += 1;
+    *consumed += 1;
     return awoken;
+}
+
+static bool IRAM_ATTR retrieve_line_isr(RenderContext_t* ctx,uint8_t* buf) {
+    return retrieve_line(ctx,buf,&ctx->lines_consumed);
+}
+typedef struct {RenderContext_t* ctx;int consumed;} PhaseSource;
+static bool retrieve_prepared_line(void* payload,uint8_t* buf) {
+    PhaseSource* source=payload;
+    return retrieve_line(source->ctx,buf,&source->consumed);
 }
 
 /// start the next frame in the current update cycle
@@ -86,7 +95,9 @@ static void IRAM_ATTR handle_lcd_frame_done(RenderContext_t* ctx) {
     epd_lcd_line_source_cb(NULL, NULL);
 
     // 扫描先于供数结束时置错，禁止残留行进入下一相位
-    if (ctx->lines_consumed < ctx->lines_total) {
+    if (!epd_lcd_frame_data_complete()) {
+        record_underflow(ctx,4,-1);
+    } else if (ctx->lines_consumed < ctx->lines_total) {
         record_underflow(ctx,3,-1);
     }
 
@@ -126,14 +137,23 @@ static void cancel_scan(RenderContext_t* ctx) {
     xSemaphoreGive(s_scan_lock);
 }
 
-static bool start_scan(RenderContext_t* ctx) {
+static bool start_scan(RenderContext_t* ctx, bool replay) {
     scan_lock();
     if (atomic_load_explicit(&ctx->feed_cancelled, memory_order_acquire)) {
         xSemaphoreGive(s_scan_lock);
         return false;
     }
     epd_lcd_line_source_cb((line_cb_func_t)&retrieve_line_isr, ctx);
-    epd_lcd_start_frame();
+    const bool reuse = replay && epd_lcd_has_phase_buffer();
+    if (reuse) {
+        // The driver retains the complete wire image. Retire the replayed
+        // queue prefix without another copy; no producer is active yet.
+        for(int i=0;i<NUM_RENDER_THREADS;++i)
+            atomic_store_explicit(&ctx->line_queues[i].last,
+                atomic_load_explicit(&ctx->line_queues[i].current,memory_order_acquire),memory_order_release);
+        ctx->lines_consumed = ctx->lines_total;
+    }
+    epd_lcd_start_frame(reuse);
     xSemaphoreGive(s_scan_lock);
     return true;
 }
@@ -175,6 +195,21 @@ static bool wait_feeders(RenderContext_t* ctx, unsigned* active) {
     return true;
 }
 
+static bool repeats_previous_phase(const RenderContext_t* ctx, int phase) {
+#if EPD_LCD_FULL_PHASE
+    // A complete immutable phase remains in the queue after consumption. Exact
+    // waveform equality permits replaying those bytes, including all masks and
+    // cropping. Spatial wipes vary by phase even when the source LUT is equal.
+    if (phase > 0 && !ctx->spatial_luts) {
+        const EpdWaveformPhases* phases = ctx->waveform->mode_data[ctx->waveform_index]
+            ->range_data[ctx->waveform_range];
+        return phases && phases->luts && phase < phases->phases &&
+            !memcmp(phases->luts + 64 * (phase - 1), phases->luts + 64 * phase, 64);
+    }
+#endif
+    return false;
+}
+
 void lcd_do_update(RenderContext_t* ctx) {
     if (ctx->cycle_frames<=0) return;
     if (s_scan_lock == NULL) {
@@ -182,7 +217,8 @@ void lcd_do_update(RenderContext_t* ctx) {
         assert(s_scan_lock != NULL);
     }
     const int64_t cycle_start=esp_timer_get_time();
-    uint32_t lut_us=0, feed_wait_us=0;
+    uint32_t lut_us=0, feed_wait_us=0, start_us=0, frame_wait_us=0, pace_us=0;
+    memset(ctx->feed_time_us,0,sizeof(ctx->feed_time_us));
     int64_t stage_at=esp_timer_get_time();
     int64_t phase_origin=0;
     int64_t previous_phase_start=0, period_total=0;
@@ -193,6 +229,8 @@ void lcd_do_update(RenderContext_t* ctx) {
     int64_t scan_total=0;
     int scan_min=INT32_MAX,scan_max=0,eof_gap_max=0,eof_work_max=0;
     unsigned active=0;
+    bool replay=false,prepared=false;
+    const bool direct=epd_lcd_has_phase_buffer();
     ctx->fault_reason=0;
     ctx->fault_phase=ctx->fault_line=ctx->fault_thread=0;
     ctx->scan_frame=0;
@@ -201,8 +239,9 @@ void lcd_do_update(RenderContext_t* ctx) {
         ctx->line_threads[row]=(uint8_t)(row%NUM_RENDER_THREADS);
 #if defined(CONFIG_IDF_TARGET_ESP32S31)
         // The DMA/LCD IRQ consumes part of one core's time. Give the other
-        // core two extra rows per 16, while retaining 125 queued rows on BOTH.
-        if (row%16>=14) ctx->line_threads[row]=1-epd_lcd_get_irq_core();
+        // core six extra rows per 32 when preparing alongside the prior scan.
+        // Hardware timings include the IRQ cost: 13:19 balances both feeders.
+        if (!direct && row%32>=26) ctx->line_threads[row]=1-epd_lcd_get_irq_core();
 #endif
     }
     atomic_store_explicit(&ctx->feed_cancelled,false,memory_order_release);
@@ -216,7 +255,7 @@ void lcd_do_update(RenderContext_t* ctx) {
     notify_feeders(ctx);
     for (int k=0;k<ctx->cycle_frames;++k) {
         stage_at=esp_timer_get_time();
-        for (int i=0;i<NUM_RENDER_THREADS;++i) {
+        for (int i=0;!replay && !prepared && i<NUM_RENDER_THREADS;++i) {
             if (xSemaphoreTake(ctx->prefill_done,pdMS_TO_TICKS(2000))!=pdTRUE) {
                 ESP_LOGE("epd_lcd","prefill timeout @frame %d",k+1);
                 ctx->error|=EPD_DRAW_EMPTY_LINE_QUEUE;
@@ -228,7 +267,9 @@ void lcd_do_update(RenderContext_t* ctx) {
         if (k==0) phase_origin=esp_timer_get_time();
         const int64_t deadline=phase_origin+
             ((int64_t)k*1000000+EPD_PHASE_HZ-1)/EPD_PHASE_HZ;
+        stage_at=esp_timer_get_time();
         pace_phase(deadline);
+        pace_us+=esp_timer_get_time()-stage_at;
         const int64_t phase_start=esp_timer_get_time();
         if (previous_phase_start) {
             const int period=(int)(phase_start-previous_phase_start);
@@ -238,24 +279,52 @@ void lcd_do_update(RenderContext_t* ctx) {
         }
         previous_phase_start=phase_start;
         ctx->scan_frame=k;
-        ctx->lines_consumed=0;
+        ctx->lines_consumed=prepared ? ctx->lines_total : 0;
+        int phase_start_row[NUM_RENDER_THREADS];
+        for(int i=0;i<NUM_RENDER_THREADS;++i)
+            phase_start_row[i]=atomic_load_explicit(&ctx->line_queues[i].last,memory_order_acquire);
         epd_lcd_frame_done_cb((frame_done_func_t)handle_lcd_frame_done,ctx);
-        if (!start_scan(ctx)) goto failed;
+        stage_at=esp_timer_get_time();
+        if (!start_scan(ctx,replay)) goto failed;
+        start_us+=esp_timer_get_time()-stage_at;
 
         // 供数结束后，ISR 仅持有队列数据；尾部扫描时可复用 LUT 准备下一相。
         stage_at=esp_timer_get_time();
         if (!wait_feeders(ctx,&active)) goto failed;
         feed_wait_us+=esp_timer_get_time()-stage_at;
         if (ctx->error) goto failed;
+        const bool replay_next=k+1<ctx->cycle_frames && repeats_previous_phase(ctx,k+1);
+        prepared=false;
         if (k+1<ctx->cycle_frames) {
             ctx->current_frame=k+1;
             stage_at=esp_timer_get_time();
             prepare_context_for_next_frame(ctx);
             lut_us+=esp_timer_get_time()-stage_at;
-            active=(1u<<NUM_RENDER_THREADS)-1;
-            notify_feeders(ctx);
+            if(!replay_next) {
+                active=(1u<<NUM_RENDER_THREADS)-1;
+                notify_feeders(ctx);
+                if(direct) {
+                    // Both producers may finish while the previous immutable
+                    // wire image is scanned. Packing uses its own row cursor,
+                    // so completion still validates the current scan's source.
+                    stage_at=esp_timer_get_time();
+                    for(int i=0;i<NUM_RENDER_THREADS;++i)
+                        if(xSemaphoreTake(ctx->prefill_done,pdMS_TO_TICKS(2000))!=pdTRUE) {
+                            ctx->error|=EPD_DRAW_EMPTY_LINE_QUEUE;goto failed;
+                        }
+                    if(!wait_feeders(ctx,&active) || ctx->error)goto failed;
+                    feed_wait_us+=esp_timer_get_time()-stage_at;
+                    PhaseSource source={ctx,0};
+                    stage_at=esp_timer_get_time();
+                    epd_lcd_prepare_frame(retrieve_prepared_line,&source);
+                    start_us+=esp_timer_get_time()-stage_at;
+                    if(ctx->error || source.consumed!=ctx->lines_total)goto failed;
+                    prepared=true;
+                }
+            }
         }
 
+        stage_at=esp_timer_get_time();
         if (xSemaphoreTake(ctx->frame_done,pdMS_TO_TICKS(2000))!=pdTRUE) {
             ESP_LOGE("epd_lcd","LCD frame %d/%d timeout err=0x%x consumed=%d/%d",
                 k+1,ctx->cycle_frames,ctx->error,ctx->lines_consumed,ctx->lines_total);
@@ -264,6 +333,17 @@ void lcd_do_update(RenderContext_t* ctx) {
         }
         if (ctx->error) goto failed;
 
+        if(replay_next && !direct) {
+            // No producer was started. Only rewind after the prior ISR has
+            // completed; the immutable rows then become the next full prefill.
+            for(int i=0;i<NUM_RENDER_THREADS;++i)
+                atomic_store_explicit(&ctx->line_queues[i].last,phase_start_row[i],memory_order_release);
+            for(int row=0;row<ctx->lines_total;++row)
+                __atomic_store_n(&ctx->line_ready[row],k+2,__ATOMIC_RELEASE);
+        }
+        replay=replay_next;
+
+        frame_wait_us+=esp_timer_get_time()-stage_at;
         ++completed_frames;
         const int64_t spv_start=epd_lcd_get_spv_start_us();
         if (previous_spv_start) {
@@ -296,7 +376,7 @@ failed:
         ESP_LOGE("epd_lcd","stream fault reason=%d phase=%d/%d line=%d/%d owner=%d ready=%d q0=%d/%d q1=%d/%d prefill=%d eof_gap=%dus eof_work=%dus",
             ctx->fault_reason,ctx->fault_phase,ctx->cycle_frames,ctx->fault_line,ctx->lines_total,
             ctx->fault_thread,ctx->fault_ready,ctx->fault_write[0],ctx->fault_read[0],
-            ctx->fault_write[1],ctx->fault_read[1],s_prefill_per_thread*NUM_RENDER_THREADS,eof_gap,eof_work);
+            ctx->fault_write[1],ctx->fault_read[1],EPD_LCD_FULL_PHASE ? ctx->lines_total : s_prefill_per_thread*NUM_RENDER_THREADS,eof_gap,eof_work);
     }
     for (int i=0;i<NUM_RENDER_THREADS;++i) lq_reset(&ctx->line_queues[i]);
 
@@ -311,6 +391,8 @@ finished:
 
     EpdMetrics sample={0};
     sample.cycle_us=esp_timer_get_time()-cycle_start; sample.scan_us=scan_total;
+    sample.start_us=start_us; sample.frame_wait_us=frame_wait_us; sample.pace_us=pace_us;
+    sample.feed0_us=ctx->feed_time_us[0];sample.feed1_us=ctx->feed_time_us[1];
     sample.lut_us=lut_us; sample.feed_wait_us=feed_wait_us;
     sample.phases=ctx->cycle_frames; sample.completed=completed_frames;
     sample.fault_phase=ctx->fault_phase;
@@ -405,7 +487,7 @@ void epd_push_pixels_lcd(RenderContext_t* ctx, short time, int color) {
     epd_lcd_line_source_cb((line_cb_func_t)&push_pixels_isr, ctx);
 
     epd_set_mode(1);
-    epd_lcd_start_frame();
+    epd_lcd_start_frame(false);
     if (xSemaphoreTake(ctx->frame_done, pdMS_TO_TICKS(2000)) != pdTRUE) {
         ctx->error |= EPD_DRAW_EMPTY_LINE_QUEUE;
         epd_lcd_abort_frame();
@@ -467,7 +549,8 @@ static uint8_t* IRAM_ATTR wait_line_buffer(RenderContext_t* ctx,LineQueue_t* que
     }
 }
 
-// Prefill 125 rows per 127-slot queue before enabling the faster native scan.
+// A full-phase queue publishes only after every owned row is immutable. Radio
+// interrupts may delay preparation but cannot starve a running panel scan.
 __attribute__((optimize("O3"))) void IRAM_ATTR
 lcd_calculate_frame(RenderContext_t* ctx, int thread_id) {
     assert(ctx->lut_lookup_func != NULL);
@@ -487,13 +570,18 @@ lcd_calculate_frame(RenderContext_t* ctx, int thread_id) {
 
     assert(area.width == ctx->display_width && area.x == 0 && !ctx->error);
 
+#if EPD_LCD_FULL_PHASE
+    const int prefill_rows = ctx->lines_total;
+    assert(lq->size >= epd_lcd_phase_queue_capacity(ctx->lines_total));
+#else
     const int prefill_rows = int_min(s_prefill_per_thread,lq->size-1);
+#endif
     bool prefill_sent=false;
     int prefill_last=-1;
     for (int row=0,count=0;row<ctx->lines_total && count<prefill_rows;++row)
         if (ctx->line_threads[row]==thread_id) { prefill_last=row; ++count; }
 
-    // Fixed ownership bounds each producer to 125 prefill slots.
+    // Fixed ownership keeps current and upcoming phase rows in FIFO order.
     for (l=0; l<ctx->lines_total; ++l) {
         if (ctx->line_threads[l]!=thread_id) continue;
         if (atomic_load_explicit(&ctx->feed_cancelled, memory_order_acquire)) return;

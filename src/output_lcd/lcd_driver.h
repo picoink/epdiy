@@ -52,7 +52,12 @@ void epd_lcd_init(const LcdEpdConfig_t* config, int display_width, int display_h
 void epd_lcd_deinit();
 void epd_lcd_frame_done_cb(frame_done_func_t, void* payload);
 void epd_lcd_line_source_cb(line_cb_func_t, void* payload);
-void epd_lcd_start_frame();
+// Reuse is valid only for an identical immutable phase after prior completion.
+bool epd_lcd_has_phase_buffer(void);
+bool epd_lcd_frame_data_complete(void);
+// Task-side packing of an inactive immutable phase, safe during the prior scan.
+void epd_lcd_prepare_frame(line_cb_func_t source, void* payload);
+void epd_lcd_start_frame(bool reuse_phase);
 void epd_lcd_prime_white_border(bool enable);
 int epd_lcd_white_border_pixels(void);
 /** @brief 获取驱动实际配置的扫描行数，须在 LCD 初始化后调用。 */
